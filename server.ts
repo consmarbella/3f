@@ -1418,6 +1418,28 @@ export function gadsRequestId(data: any): string | null {
 
 // (buildAdOperations y buildAssetCreates también viven en googleAdsCompat.ts)
 
+// Moneda real de la cuenta vía GAQL (para normalizar bids a la billable unit).
+// Si falla, fallback USD registrado como corrección (no ciego).
+async function fetchAccountCurrencyCode(
+  customerId: string,
+  headers: Record<string, string>
+): Promise<{ currencyCode: string; viaFallback: boolean }> {
+  try {
+    const r = await fetch(
+      `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}/customers/${customerId}/googleAds:search`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ query: "SELECT customer.currency_code FROM customer LIMIT 1" }),
+      }
+    );
+    const { ok, data } = await safeGoogleAdsJson(r);
+    const code = data?.results?.[0]?.customer?.currencyCode;
+    if (ok && code) return { currencyCode: String(code).toUpperCase(), viaFallback: false };
+  } catch {}
+  return { currencyCode: "USD", viaFallback: true };
+}
+
 // Endpoint: /api/google-ads/publish - Real Google Ads API Mutation in PAUSED status
 app.post("/api/google-ads/publish", async (req, res) => {
   try {
@@ -1604,8 +1626,35 @@ app.post("/api/google-ads/publish", async (req, res) => {
       });
     };
 
-    // 3. AdGroups válidos según spec (uno por intención STAG)
-    const adGroupOperations = plan.buildAdGroupOperations(campaignResourceName);
+    // 3. AdGroups válidos según spec. La moneda se obtiene por GAQL y cada
+    // cpc se normaliza a la billable unit (nunca se envía el default directo).
+    const currencyLookup = await fetchAccountCurrencyCode(cleanCustomerId, headers);
+    const currencyCode = currencyLookup.currencyCode;
+    if (currencyLookup.viaFallback) {
+      correctionsApplied.push({
+        area: "adGroups",
+        field: "currencyCode",
+        before: "GAQL fallido",
+        after: "USD (fallback)",
+        reason: "No se pudo leer la moneda: default registrado, no ciego",
+      });
+    }
+    const { operations: adGroupOperations, bidDetails } = plan.buildAdGroupOperations(
+      campaignResourceName,
+      currencyCode
+    );
+    bidDetails.forEach((d) => {
+      console.log("[Google Ads] cpc bid:", JSON.stringify(d));
+      if (d.normalizedBidMicros !== d.requestedBidMicros) {
+        correctionsApplied.push({
+          area: "adGroups",
+          field: `cpcBidMicros:${d.adGroup}`,
+          before: String(d.requestedBidMicros),
+          after: String(d.normalizedBidMicros),
+          reason: `Billable unit ${currencyCode} (${d.billableUnitMicros} micros)${d.appliedMinimum ? " + mínimo aplicado" : ""}`,
+        });
+      }
+    });
 
     const { ok: agOk, status: agStatus, data: agData } = await runStage("adGroups", "adGroups", adGroupOperations);
     if (!agOk) {
