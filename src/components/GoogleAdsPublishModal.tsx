@@ -18,7 +18,10 @@ import {
   Link2,
   ChevronDown,
   ChevronUp,
+  Download,
+  FileText,
 } from "lucide-react";
+import { exportToGoogleAdsEditorCSV, downloadFile } from "../utils/googleAdsUtils";
 
 interface GoogleAdsAccount {
   id: string;
@@ -117,9 +120,9 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
     } catch (e) {}
   }, []);
 
-  // Listen for OAuth popup completion message
+  // Listen for OAuth popup completion message or code return
   useEffect(() => {
-    const handleMessage = (event: MessageEvent) => {
+    const handleMessage = async (event: MessageEvent) => {
       if (event.data?.type === "GOOGLE_ADS_AUTH_SUCCESS") {
         if (event.data.sessionId) {
           try {
@@ -135,12 +138,28 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
         }
         setAuthError(null);
         fetchAccounts();
+      } else if (event.data?.type === "GOOGLE_ADS_AUTH_CODE") {
+        if (event.data.code) {
+          await handleExchangeCode(event.data.code, event.data.redirectUri || event.data.rawUrl);
+        }
       } else if (event.data?.type === "GOOGLE_ADS_AUTH_ERROR") {
         setAuthError(event.data.error || "Ocurrió un error durante la autenticación con Google.");
       }
     };
 
     window.addEventListener("message", handleMessage);
+
+    // Also check if an auth code was left in localStorage
+    try {
+      const pendingCode = localStorage.getItem("gads_pending_auth_code");
+      const pendingUrl = localStorage.getItem("gads_pending_auth_url");
+      if (pendingCode) {
+        localStorage.removeItem("gads_pending_auth_code");
+        localStorage.removeItem("gads_pending_auth_url");
+        handleExchangeCode(pendingCode, pendingUrl || undefined);
+      }
+    } catch {}
+
     return () => window.removeEventListener("message", handleMessage);
   }, []);
 
@@ -178,7 +197,7 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
         headers: getAuthHeaders(),
         credentials: "include",
       });
-      if (res.ok) {
+      if (res.ok && res.headers.get("content-type")?.includes("application/json")) {
         const data = await res.json();
         const hasAuth = !!data.authenticated;
         setIsAuthenticated(hasAuth);
@@ -205,7 +224,7 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
         headers: getAuthHeaders(),
         credentials: "include",
       });
-      if (res.ok) {
+      if (res.ok && res.headers.get("content-type")?.includes("application/json")) {
         const data = await res.json();
         setEnvStatus(data);
       }
@@ -224,6 +243,9 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
         headers: getAuthHeaders(),
         credentials: "include",
       });
+      if (!res.headers.get("content-type")?.includes("application/json")) {
+        return;
+      }
       const data = await res.json();
       if (data.success && Array.isArray(data.accounts)) {
         setAccounts(data.accounts);
@@ -303,19 +325,20 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
     }
   };
 
-  const handleExchangeCode = async () => {
-    if (!manualExchangeInput.trim()) return;
+  const handleExchangeCode = async (overrideCode?: string, overrideUri?: string) => {
+    const inputToUse = (overrideCode || manualExchangeInput).trim();
+    if (!inputToUse) return;
     setIsExchangingCode(true);
     setManualExchangeError(null);
     setManualExchangeSuccess(null);
     try {
-      const targetUri = getTargetRedirectUri();
+      const targetUri = overrideUri || getTargetRedirectUri();
       const res = await fetch("/api/google-oauth/exchange-code", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          rawUrl: manualExchangeInput.trim(),
-          code: manualExchangeInput.trim(),
+          rawUrl: inputToUse,
+          code: inputToUse,
           redirectUri: targetUri,
         }),
       });
@@ -404,9 +427,14 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
   };
 
   const handlePublish = async () => {
-    const finalCustomerId = isManualInput
-      ? manualCustomerId.replace(/[^0-9]/g, "")
-      : selectedCustomerId.replace(/[^0-9]/g, "");
+    const manualClean = manualCustomerId.replace(/[^0-9]/g, "");
+    const selectedClean = selectedCustomerId.replace(/[^0-9]/g, "");
+    const finalCustomerId =
+      manualClean && manualClean.length >= 8
+        ? manualClean
+        : selectedClean && selectedClean.length >= 8
+        ? selectedClean
+        : manualClean || selectedClean;
 
     if (!finalCustomerId || finalCustomerId.length < 8) {
       setPublishError("Por favor ingresa o selecciona un Customer ID válido de Google Ads (10 dígitos).");
@@ -431,6 +459,17 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
           campaignData,
         }),
       });
+
+      const contentType = res.headers.get("content-type");
+      if (!contentType || !contentType.includes("application/json")) {
+        const rawText = await res.text();
+        if (rawText.includes("<!DOCTYPE") || rawText.includes("<html")) {
+          throw new Error(
+            "El endpoint /api/google-ads/publish devolvió HTML en lugar de JSON. Esto ocurre cuando se prueba en Vercel antes de desplegar la configuración serverless /api/ o cuando faltan las variables backend (.env) en Vercel. Puedes probar la publicación directamente desde este preview de AI Studio donde el backend está activo."
+          );
+        }
+        throw new Error(`El servidor devolvió un formato no válido (${res.status}): ${rawText.slice(0, 120)}`);
+      }
 
       const data = await res.json();
       if (!res.ok || !data.success) {
@@ -602,19 +641,82 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
                       Conecta tu cuenta de Google Cloud / Google Ads para autenticarte y autorizar la mutación de campañas en estado <strong className="text-emerald-400">PAUSED</strong>.
                     </p>
 
+                    {/* CAJA DE SOLUCIÓN DIRECTA PARA Error 400: redirect_uri_mismatch */}
+                    <div className="p-4 bg-amber-950/30 border border-amber-500/40 rounded-xl space-y-3">
+                      <div className="flex items-start gap-2.5">
+                        <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                        <div className="space-y-1">
+                          <h5 className="text-xs font-bold text-amber-200">
+                            ¿Aparece "Acceso bloqueado / Error 400: redirect_uri_mismatch"?
+                          </h5>
+                          <p className="text-[11px] text-slate-300 leading-relaxed">
+                            Google bloquea la solicitud si la URI enviada no está idéntica en tus <strong>URIs de redireccionamiento autorizados</strong> en Google Cloud Console. Elige una de estas 2 soluciones:
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs pt-1">
+                        <div className={`p-3 rounded-xl border transition-all ${
+                          redirectOption === "vercel"
+                            ? "bg-emerald-950/30 border-emerald-500/50 text-emerald-200"
+                            : "bg-slate-900/80 border-slate-800 text-slate-300"
+                        }`}>
+                          <div className="flex items-center justify-between font-bold text-xs mb-1">
+                            <span className="text-emerald-400">Opción 1: Si registraste Vercel</span>
+                            {redirectOption === "vercel" && <Check className="w-3.5 h-3.5 text-emerald-400" />}
+                          </div>
+                          <p className="text-[11px] text-slate-400 mb-2">
+                            Si en Google Cloud pusiste la URL de Vercel, activa esta opción antes de conectar.
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => setRedirectOption("vercel")}
+                            className="w-full py-1.5 px-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg text-[11px] transition-all cursor-pointer shadow"
+                          >
+                            {redirectOption === "vercel" ? "✓ Opción Vercel Seleccionada" : "Usar Redirección Vercel"}
+                          </button>
+                        </div>
+
+                        <div className={`p-3 rounded-xl border transition-all ${
+                          redirectOption === "app"
+                            ? "bg-indigo-950/30 border-indigo-500/50 text-indigo-200"
+                            : "bg-slate-900/80 border-slate-800 text-slate-300"
+                        }`}>
+                          <div className="flex items-center justify-between font-bold text-xs mb-1">
+                            <span className="text-indigo-400">Opción 2: Preview de AI Studio</span>
+                            {redirectOption === "app" && <Check className="w-3.5 h-3.5 text-indigo-400" />}
+                          </div>
+                          <p className="text-[11px] text-slate-400 mb-2">
+                            Copia esta URI y agrégala a tu Cliente OAuth en Google Cloud Console.
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setRedirectOption("app");
+                              copyToClipboard(`${window.location.origin}/auth/callback`);
+                            }}
+                            className="w-full py-1.5 px-3 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-lg text-[11px] transition-all cursor-pointer flex items-center justify-center gap-1.5 shadow"
+                          >
+                            <Copy className="w-3 h-3" />
+                            <span>Copiar URI del Preview Actual</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
                     {/* Selector de URI de Redirección Autorizada */}
                     <div className="p-3.5 bg-slate-900/90 rounded-xl border border-slate-800 space-y-2.5">
                       <div className="flex items-center justify-between">
                         <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
                           <Link2 className="w-3.5 h-3.5 text-indigo-400" />
-                          <span>URI de Redireccionamiento OAuth</span>
+                          <span>URI Activa que se enviará a Google</span>
                         </label>
                         <span className="text-[10px] text-slate-400 font-mono">
                           Google Cloud Console
                         </span>
                       </div>
 
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
                         <button
                           type="button"
                           onClick={() => setRedirectOption("app")}
@@ -625,10 +727,10 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
                           }`}
                         >
                           <div className="font-semibold text-xs flex items-center justify-between">
-                            <span>App Actual (Recomendado)</span>
+                            <span>Preview Actual</span>
                             {redirectOption === "app" && <Check className="w-3.5 h-3.5 text-indigo-400" />}
                           </div>
-                          <div className="text-[11px] text-slate-400 truncate mt-0.5 font-mono">
+                          <div className="text-[10px] text-slate-400 truncate mt-0.5 font-mono">
                             {window.location.origin}/auth/callback
                           </div>
                         </button>
@@ -646,11 +748,41 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
                             <span>Dominio Vercel</span>
                             {redirectOption === "vercel" && <Check className="w-3.5 h-3.5 text-indigo-400" />}
                           </div>
-                          <div className="text-[11px] text-slate-400 truncate mt-0.5 font-mono">
+                          <div className="text-[10px] text-slate-400 truncate mt-0.5 font-mono">
                             https://3f-six.vercel.app/auth/callback
                           </div>
                         </button>
+
+                        <button
+                          type="button"
+                          onClick={() => setRedirectOption("custom")}
+                          className={`p-2.5 rounded-lg border text-left transition-all cursor-pointer ${
+                            redirectOption === "custom"
+                              ? "bg-indigo-950/40 border-indigo-500/50 text-white"
+                              : "bg-slate-950/40 border-slate-800 text-slate-400 hover:text-slate-300"
+                          }`}
+                        >
+                          <div className="font-semibold text-xs flex items-center justify-between">
+                            <span>Personalizada</span>
+                            {redirectOption === "custom" && <Check className="w-3.5 h-3.5 text-indigo-400" />}
+                          </div>
+                          <div className="text-[10px] text-slate-400 truncate mt-0.5 font-mono">
+                            {customRedirectUri || "Escribir otra URI..."}
+                          </div>
+                        </button>
                       </div>
+
+                      {redirectOption === "custom" && (
+                        <div className="pt-1">
+                          <input
+                            type="text"
+                            placeholder="Pega la URI exacta registrada en Google Cloud (ej: http://localhost:3000/auth/callback)"
+                            value={customRedirectUri}
+                            onChange={(e) => setCustomRedirectUri(e.target.value)}
+                            className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs font-mono text-white placeholder-slate-500 focus:outline-none focus:border-indigo-400"
+                          />
+                        </div>
+                      )}
 
                       {/* Display of Active Target URI and Copy Button */}
                       <div className="flex items-center gap-2 pt-1">
@@ -677,9 +809,18 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
                         </button>
                       </div>
 
-                      <p className="text-[11px] text-slate-400 leading-normal">
-                        Para evitar el error <code className="text-amber-400">redirect_uri_mismatch</code>, copia esta URI exacta y agrégala en <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer" className="text-indigo-400 underline hover:text-indigo-300">Google Cloud Console &gt; Credenciales &gt; Tu Cliente Web</a> en <em>"URIs de redireccionamiento autorizados"</em>.
-                      </p>
+                      <div className="pt-1 flex items-center justify-between text-[11px] text-slate-400">
+                        <span>Configurar en:</span>
+                        <a
+                          href="https://console.cloud.google.com/apis/credentials"
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-indigo-400 hover:text-indigo-300 underline flex items-center gap-1"
+                        >
+                          <span>Google Cloud Console &gt; Credenciales OAuth</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      </div>
                     </div>
 
                     {authError && (
@@ -930,7 +1071,10 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
                         autoComplete="off"
                         placeholder="Ejemplo: 123-456-7890 o 1234567890"
                         value={manualCustomerId}
-                        onChange={(e) => setManualCustomerId(e.target.value)}
+                        onChange={(e) => {
+                          setManualCustomerId(e.target.value);
+                          setIsManualInput(true);
+                        }}
                         className="w-full px-3.5 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-xs font-mono text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 cursor-text relative z-10 transition-colors"
                       />
                       <p className="text-[11px] text-slate-500 mt-1">
@@ -1066,7 +1210,7 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
                 )}
 
                 {publishError && (
-                  <div className="p-4 bg-red-950/60 border border-red-500/40 rounded-xl space-y-2 text-xs">
+                  <div className="p-4 bg-red-950/60 border border-red-500/40 rounded-xl space-y-3 text-xs">
                     <div className="flex items-center gap-2 text-red-400 font-bold">
                       <AlertTriangle className="w-4 h-4 shrink-0" />
                       <span>{publishError}</span>
@@ -1075,6 +1219,61 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
                       <pre className="p-2 bg-slate-950/80 rounded border border-red-900/50 text-[10px] text-red-300 font-mono overflow-x-auto max-h-32">
                         {JSON.stringify(publishDetails, null, 2)}
                       </pre>
+                    )}
+
+                    {/* Caso 1: Error de nivel de acceso en Google Ads (Test vs Production) */}
+                    {(publishError.includes("CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION") ||
+                      publishError.includes("test accounts") ||
+                      JSON.stringify(publishDetails || {}).includes("CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION")) && (
+                      <div className="p-3 bg-amber-950/50 border border-amber-500/40 rounded-lg text-amber-200 space-y-2 mt-2">
+                        <div className="font-bold flex items-center gap-1.5 text-amber-300">
+                          <Info className="w-4 h-4 shrink-0" />
+                          <span>Google Ads exige Acceso Básico para cuentas de producción</span>
+                        </div>
+                        <p className="text-[11px] leading-relaxed text-amber-100/90">
+                          Tu Developer Token de Google Ads está en <strong>Modo de Prueba (Test Access)</strong>. Google restringe las llamadas de API directa en modo prueba a cuentas de prueba (MCC de prueba). Para tu cuenta real <strong className="text-white">444-752-9837</strong>, Google requiere solicitar "Basic Access" en el Centro de API.
+                        </p>
+                        <div className="pt-2 border-t border-amber-500/30 flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const csv = exportToGoogleAdsEditorCSV(campaignData);
+                              downloadFile(csv, `${campaignData.campaignName.replace(/[^a-zA-Z0-9]/g, "_")}_GoogleAdsEditor.csv`, "text/csv;charset=utf-8;");
+                            }}
+                            className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg text-xs flex items-center gap-1.5 cursor-pointer shadow transition-colors"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            <span>Descargar CSV para Google Ads Editor (Subida Inmediata)</span>
+                          </button>
+                        </div>
+                        <p className="text-[10px] text-amber-300/80 italic">
+                          💡 Con el archivo CSV puedes importar la campaña completa en 10 segundos en Google Ads Editor oficial sin esperar la auditoría de API de Google.
+                        </p>
+                      </div>
+                    )}
+
+                    {/* Caso 2: Error de endpoint devolviendo HTML */}
+                    {publishError.includes("HTML en lugar de JSON") && (
+                      <div className="p-3 bg-indigo-950/50 border border-indigo-500/40 rounded-lg text-indigo-200 space-y-2 mt-2">
+                        <div className="font-bold flex items-center gap-1.5 text-indigo-300">
+                          <Info className="w-4 h-4 shrink-0" />
+                          <span>Entorno de Ejecución</span>
+                        </div>
+                        <p className="text-[11px] leading-relaxed text-indigo-100/90">
+                          Si estás en Vercel, aún no se ha desplegado la función serverless de backend. Puedes descargar el archivo oficial de Google Ads Editor para importarla ahora mismo:
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const csv = exportToGoogleAdsEditorCSV(campaignData);
+                            downloadFile(csv, `${campaignData.campaignName.replace(/[^a-zA-Z0-9]/g, "_")}_GoogleAdsEditor.csv`, "text/csv;charset=utf-8;");
+                          }}
+                          className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg text-xs flex items-center gap-1.5 cursor-pointer shadow transition-colors"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Descargar CSV para Google Ads Editor</span>
+                        </button>
+                      </div>
                     )}
                   </div>
                 )}

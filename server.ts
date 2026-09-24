@@ -53,6 +53,35 @@ function getSessionFromRequest(req: express.Request): GoogleAdsSession | null {
   return gadsSessions.get(sessionId) || null;
 }
 
+// Google Ads API configuration
+const GOOGLE_ADS_API_VERSION = "v25";
+
+async function safeGoogleAdsJson(res: any): Promise<{ ok: boolean; status: number; data: any }> {
+  try {
+    const text = await res.text();
+    try {
+      const data = JSON.parse(text);
+      return { ok: res.ok, status: res.status, data };
+    } catch {
+      return {
+        ok: false,
+        status: res.status,
+        data: {
+          error: {
+            message: `Google Ads API respondió con status ${res.status} (no JSON). Verifica que el Customer ID pertenezca a la cuenta autorizada y que el Developer Token esté activo.`,
+          },
+        },
+      };
+    }
+  } catch (err: any) {
+    return {
+      ok: false,
+      status: 500,
+      data: { error: { message: err?.message || "Error al procesar respuesta de Google Ads API." } },
+    };
+  }
+}
+
 async function getValidAccessToken(session: GoogleAdsSession): Promise<string> {
   // If token expires in less than 2 minutes and refresh_token exists, refresh it
   if (Date.now() > session.expiresAt - 120000 && session.refreshToken) {
@@ -1270,17 +1299,17 @@ app.get("/api/google-ads/accounts", async (req, res) => {
       headers["login-customer-id"] = process.env.GOOGLE_ADS_LOGIN_CUSTOMER_ID.replace(/[^0-9]/g, "");
     }
 
-    const gadsRes = await fetch("https://googleads.googleapis.com/v19/customers:listAccessibleCustomers", {
+    const gadsRes = await fetch(`https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}/customers:listAccessibleCustomers`, {
       headers,
     });
 
-    const gadsData = await gadsRes.json();
-    if (!gadsRes.ok) {
+    const { ok: gadsOk, status: gadsStatus, data: gadsData } = await safeGoogleAdsJson(gadsRes);
+    if (!gadsOk) {
       const errorMsg =
         gadsData.error?.details?.[0]?.errors?.[0]?.message ||
         gadsData.error?.message ||
         "Error al consultar cuentas accesibles en Google Ads API.";
-      return res.status(gadsRes.status).json({
+      return res.status(gadsStatus).json({
         success: false,
         authenticated: true,
         user: session.userInfo,
@@ -1381,7 +1410,7 @@ app.post("/api/google-ads/publish", async (req, res) => {
     const budgetName = `Presupuesto ${campaignData.campaignName.slice(0, 45)} [${Date.now().toString().slice(-6)}]`;
 
     const budgetRes = await fetch(
-      `https://googleads.googleapis.com/v19/customers/${cleanCustomerId}/campaignBudgets:mutate`,
+      `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}/customers/${cleanCustomerId}/campaignBudgets:mutate`,
       {
         method: "POST",
         headers,
@@ -1400,13 +1429,13 @@ app.post("/api/google-ads/publish", async (req, res) => {
       }
     );
 
-    const budgetData = await budgetRes.json();
-    if (!budgetRes.ok) {
+    const { ok: budgetOk, status: budgetStatus, data: budgetData } = await safeGoogleAdsJson(budgetRes);
+    if (!budgetOk) {
       const errMsg =
         budgetData.error?.details?.[0]?.errors?.[0]?.message ||
         budgetData.error?.message ||
         "Error al crear el presupuesto de campaña en Google Ads.";
-      return res.status(budgetRes.status).json({
+      return res.status(budgetStatus).json({
         success: false,
         error: `Error en Google Ads API (Budget): ${errMsg}`,
         googleDetails: budgetData.error,
@@ -1418,7 +1447,7 @@ app.post("/api/google-ads/publish", async (req, res) => {
     // 2. Create Campaign in PAUSED status
     const cleanCampaignName = `${campaignData.campaignName.slice(0, 110)} [${new Date().toISOString().slice(0, 10)}]`;
     const campaignRes = await fetch(
-      `https://googleads.googleapis.com/v19/customers/${cleanCustomerId}/campaigns:mutate`,
+      `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}/customers/${cleanCustomerId}/campaigns:mutate`,
       {
         method: "POST",
         headers,
@@ -1436,6 +1465,7 @@ app.post("/api/google-ads/publish", async (req, res) => {
                   targetContentNetwork: false, // Display explicitly OFF
                   targetPartnerSearchNetwork: false,
                 },
+                containsEuPoliticalAdvertising: "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
                 maximizeConversions: {},
               },
             },
@@ -1444,13 +1474,13 @@ app.post("/api/google-ads/publish", async (req, res) => {
       }
     );
 
-    const campaignRespData = await campaignRes.json();
-    if (!campaignRes.ok) {
+    const { ok: campaignOk, status: campaignStatus, data: campaignRespData } = await safeGoogleAdsJson(campaignRes);
+    if (!campaignOk) {
       const errMsg =
         campaignRespData.error?.details?.[0]?.errors?.[0]?.message ||
         campaignRespData.error?.message ||
         "Error al crear la campaña en Google Ads.";
-      return res.status(campaignRes.status).json({
+      return res.status(campaignStatus).json({
         success: false,
         error: `Error en Google Ads API (Campaign): ${errMsg}`,
         googleDetails: campaignRespData.error,
@@ -1477,7 +1507,7 @@ app.post("/api/google-ads/publish", async (req, res) => {
     }));
 
     const adGroupsRes = await fetch(
-      `https://googleads.googleapis.com/v19/customers/${cleanCustomerId}/adGroups:mutate`,
+      `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}/customers/${cleanCustomerId}/adGroups:mutate`,
       {
         method: "POST",
         headers,
@@ -1485,7 +1515,7 @@ app.post("/api/google-ads/publish", async (req, res) => {
       }
     );
 
-    const adGroupsData = await adGroupsRes.json();
+    const { data: adGroupsData } = await safeGoogleAdsJson(adGroupsRes);
     const adGroupResourceNames: string[] = (adGroupsData.results || []).map((r: any) => r.resourceName);
 
     // 4. Create Responsive Search Ads (RSA) in each Ad Group in PAUSED status
@@ -1529,7 +1559,7 @@ app.post("/api/google-ads/publish", async (req, res) => {
 
     if (adOperations.length > 0) {
       await fetch(
-        `https://googleads.googleapis.com/v19/customers/${cleanCustomerId}/adGroupAds:mutate`,
+        `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}/customers/${cleanCustomerId}/adGroupAds:mutate`,
         {
           method: "POST",
           headers,
@@ -1561,6 +1591,9 @@ app.post("/api/google-ads/publish", async (req, res) => {
 });
 
 async function startServer() {
+  if (process.env.VERCEL) {
+    return;
+  }
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -1580,4 +1613,9 @@ async function startServer() {
   });
 }
 
-startServer();
+if (!process.env.VERCEL) {
+  startServer();
+}
+
+export { app };
+export default app;

@@ -1,16 +1,25 @@
 import React, { useState } from "react";
 import { BriefInput, PresetTemplate } from "../types";
 import { PRESETS } from "../data/presets";
-import { Sparkles, Building2, Globe, DollarSign, Target, ShieldAlert, FileText, Check, Wand2, X } from "lucide-react";
+import { Sparkles, Building2, Globe, DollarSign, Target, ShieldAlert, FileText, Check, Wand2, X, AlertTriangle, Zap } from "lucide-react";
 
 interface BriefingFormProps {
   onSubmit: (brief: BriefInput) => void;
   isLoading: boolean;
   initialBrief?: BriefInput;
   onClose?: () => void;
+  error?: string | null;
+  onInstantGenerate?: (brief: BriefInput) => void;
 }
 
-export const BriefingForm: React.FC<BriefingFormProps> = ({ onSubmit, isLoading, initialBrief, onClose }) => {
+export const BriefingForm: React.FC<BriefingFormProps> = ({
+  onSubmit,
+  isLoading,
+  initialBrief,
+  onClose,
+  error,
+  onInstantGenerate,
+}) => {
   const [formData, setFormData] = useState<BriefInput>(
     initialBrief || {
       businessName: "Torres Abogados",
@@ -305,12 +314,48 @@ export const BriefingForm: React.FC<BriefingFormProps> = ({ onSubmit, isLoading,
           />
         </div>
 
-        {/* Submit Action Button */}
-        <div className="pt-4 flex justify-end">
+        {/* Error Alert inside modal */}
+        {error && (
+          <div className="p-4 bg-red-950/80 border border-red-500/50 rounded-xl space-y-2.5 text-xs text-red-200">
+            <div className="flex items-center gap-2 font-bold text-red-300">
+              <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+              <span>Aviso de Generación AI</span>
+            </div>
+            <p className="leading-relaxed text-red-200/90">{error}</p>
+            {onInstantGenerate && (
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={() => onInstantGenerate(formData)}
+                  className="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold flex items-center gap-2 transition-all cursor-pointer shadow-md"
+                >
+                  <Zap className="w-3.5 h-3.5 fill-slate-950" />
+                  <span>Generar Inmediatamente con Motor Certificado Local (Sin Esperas)</span>
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Submit Action Buttons */}
+        <div className="pt-4 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+          {onInstantGenerate && (
+            <button
+              type="button"
+              disabled={isLoading}
+              onClick={() => onInstantGenerate(formData)}
+              className="px-5 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white border border-slate-700 font-semibold text-xs transition-all flex items-center justify-center space-x-2 cursor-pointer disabled:opacity-50"
+              title="Generación instantánea y determinista sin depender de APIs externas"
+            >
+              <Zap className="w-4 h-4 text-amber-400" />
+              <span>Generar con Motor Local (Instantáneo)</span>
+            </button>
+          )}
+
           <button
             type="submit"
             disabled={isLoading}
-            className="w-full sm:w-auto px-8 py-3.5 rounded-xl bg-gradient-to-r from-amber-500 via-orange-500 to-amber-600 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-base transition-all shadow-xl shadow-amber-500/25 flex items-center justify-center space-x-3 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            className="px-8 py-3.5 rounded-xl bg-gradient-to-r from-amber-500 via-orange-500 to-amber-600 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-base transition-all shadow-xl shadow-amber-500/25 flex items-center justify-center space-x-3 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed sm:ml-auto"
           >
             {isLoading ? (
               <>
