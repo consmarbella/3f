@@ -274,6 +274,7 @@ export default function App() {
               onSubmit={handleGenerateCampaign}
               isLoading={isLoading}
               initialBrief={brief}
+              onClose={campaign ? () => setShowBriefModal(false) : undefined}
             />
           </div>
         </div>

@@ -1,15 +1,16 @@
 import React, { useState } from "react";
 import { BriefInput, PresetTemplate } from "../types";
 import { PRESETS } from "../data/presets";
-import { Sparkles, Building2, Globe, DollarSign, Target, ShieldAlert, FileText, Check, Wand2 } from "lucide-react";
+import { Sparkles, Building2, Globe, DollarSign, Target, ShieldAlert, FileText, Check, Wand2, X } from "lucide-react";
 
 interface BriefingFormProps {
   onSubmit: (brief: BriefInput) => void;
   isLoading: boolean;
   initialBrief?: BriefInput;
+  onClose?: () => void;
 }
 
-export const BriefingForm: React.FC<BriefingFormProps> = ({ onSubmit, isLoading, initialBrief }) => {
+export const BriefingForm: React.FC<BriefingFormProps> = ({ onSubmit, isLoading, initialBrief, onClose }) => {
   const [formData, setFormData] = useState<BriefInput>(
     initialBrief || {
       businessName: "Torres Abogados",
@@ -50,8 +51,18 @@ export const BriefingForm: React.FC<BriefingFormProps> = ({ onSubmit, isLoading,
   return (
     <div id="briefing-form-container" className="bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-8 shadow-2xl max-w-4xl mx-auto text-slate-100">
       {/* Title Header */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-6 border-b border-slate-800">
-        <div>
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-6 border-b border-slate-800 relative">
+        {onClose && (
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Cerrar modal"
+            className="absolute -top-2 -right-2 p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white transition-colors cursor-pointer"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        )}
+        <div className="pr-8 md:pr-0">
           <div className="flex items-center space-x-2 text-amber-400 text-xs font-semibold uppercase tracking-wider mb-1">
             <Wand2 className="w-4 h-4" />
             <span>Consultoría de $5,000 USD / Configuración de Campaña</span>

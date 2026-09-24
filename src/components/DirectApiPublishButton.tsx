@@ -1,38 +1,52 @@
-import { useState } from 'react';
+import React, { useState, useEffect } from "react";
+import { GoogleAdsPublishModal } from "./GoogleAdsPublishModal";
+import { Building2, CheckCircle2 } from "lucide-react";
 
-export function DirectApiPublishButton({ campaignData }: { campaignData: any }) {
-  const [loading, setLoading] = useState(false);
+interface DirectApiPublishButtonProps {
+  campaignData: any;
+}
 
-  // Credenciales configuradas de Google Cloud Project (dolarexpress-seo)
-  const GOOGLE_CONFIG = {
-    clientId: "853150230220-eu2qj2psf1h0eja3av115fon6b8qdtjl.apps.googleusercontent.com",
-    // Nota: El Client Secret nunca debe exponerse permanentemente en código de cliente (Frontend) 
-    // en producción, pero lo dejamos mapeado para tu entorno o para la ruta del backend:
-    clientSecret: "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",
-    scope: "https://www.googleapis.com/auth/adwords"
-  };
+export function DirectApiPublishButton({ campaignData }: DirectApiPublishButtonProps) {
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isConnected, setIsConnected] = useState(false);
 
-  const handlePublish = async () => {
-    setLoading(true);
-    
-    console.log("Iniciando autenticación OAuth con Client ID:", GOOGLE_CONFIG.clientId);
-    console.log("Payload de campaña listo para mutación en estado PAUSED:", campaignData);
-
-    // Simulación de validación de conexión con las credenciales configuradas
-    setTimeout(() => {
-      setLoading(false);
-      alert('¡Credenciales cargadas! Conexión lista para inyectar la campaña en Google Ads.');
-    }, 1200);
-  };
+  // Check if session is already active
+  useEffect(() => {
+    const checkSession = async () => {
+      try {
+        const res = await fetch("/api/google-ads/session");
+        if (res.ok) {
+          const data = await res.json();
+          setIsConnected(!!data.authenticated);
+        }
+      } catch (e) {
+        // Silently fail
+      }
+    };
+    checkSession();
+  }, [isModalOpen]);
 
   return (
-    <button
-      id="btn-direct-api-publish"
-      onClick={handlePublish}
-      disabled={loading}
-      className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-600 text-white font-medium rounded-lg shadow-md transition-all flex items-center gap-2 cursor-pointer text-xs sm:text-sm"
-    >
-      <span>{loading ? 'Autenticando con Google...' : '🚀 Publicar Directo en API'}</span>
-    </button>
+    <>
+      <button
+        id="btn-direct-api-publish"
+        onClick={() => setIsModalOpen(true)}
+        className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl shadow-md shadow-emerald-600/25 transition-all flex items-center gap-2 cursor-pointer text-xs sm:text-sm active:scale-95 border border-emerald-400/30"
+      >
+        <Building2 className="w-4 h-4 text-emerald-200" />
+        <span>Publicar en Google Ads (PAUSED)</span>
+        {isConnected && (
+          <span className="w-2 h-2 rounded-full bg-white animate-pulse" title="Conectado a Google Ads" />
+        )}
+      </button>
+
+      {isModalOpen && (
+        <GoogleAdsPublishModal
+          isOpen={isModalOpen}
+          onClose={() => setIsModalOpen(false)}
+          campaignData={campaignData}
+        />
+      )}
+    </>
   );
 }
