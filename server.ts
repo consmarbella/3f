@@ -5,6 +5,7 @@ import "dotenv/config";
 import cookieParser from "cookie-parser";
 import { GoogleGenAI, Type } from "@google/genai";
 import { generateDeterministicCertifiedCampaign } from "./src/utils/certifiedCampaignEngine.js";
+import { normalizeCampaignData, matchRetryFix } from "./src/utils/googleAdsCompat.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1384,6 +1385,7 @@ export type PublishStage = {
   ok: boolean;
   created: number;
   failed: number;
+  requestId?: string | null;
   error?: string;
 };
 
@@ -1574,7 +1576,7 @@ app.post("/api/google-ads/publish", async (req, res) => {
       });
     }
 
-    const { campaignData, customerId: rawCustomerId } = req.body;
+    let { campaignData, customerId: rawCustomerId } = req.body;
     if (!campaignData || !campaignData.campaignName) {
       return res.status(400).json({
         success: false,
@@ -1617,32 +1619,47 @@ app.post("/api/google-ads/publish", async (req, res) => {
       headers["login-customer-id"] = process.env.GOOGLE_ADS_LOGIN_CUSTOMER_ID.replace(/[^0-9]/g, "");
     }
 
-    // 1. Create Campaign Budget
+    // 0. Compatibility Layer: preflight normalization de campaignData
+    // (bids, límites, mínimos RSA, match types, MANUAL_CPC, Display/Partners OFF)
+    const compatReport = normalizeCampaignData(campaignData);
+    campaignData = compatReport.data;
+    const correctionsApplied = compatReport.correctionsApplied;
+    const omittedItems = compatReport.omittedItems;
+
+    // Safe retry por etapa: ante error conocido, corrige y reintenta UNA vez
+    const runStage = async (stageName: string, service: string, operations: any[]) => {
+      let r = await gadsMutate(service, operations);
+      if (!r.ok) {
+        const fixNote = matchRetryFix(service, operations, r.data);
+        if (fixNote) {
+          correctionsApplied.push({
+            area: stageName,
+            field: service,
+            before: "rechazado por Google",
+            after: fixNote,
+            reason: "Error conocido: corrección automática + reintento",
+          });
+          r = await gadsMutate(service, operations);
+        }
+      }
+      return r;
+    };
+
+    // 1. Create Campaign Budget (monto ya normalizado: >= 1 unidad de moneda)
     const dailyBudget = Number(campaignData.settings?.dailyBudget) || 25;
     const amountMicros = String(Math.round(dailyBudget * 1000000));
     const budgetName = `Presupuesto ${campaignData.campaignName.slice(0, 45)} [${Date.now().toString().slice(-6)}]`;
 
-    const budgetRes = await fetch(
-      `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}/customers/${cleanCustomerId}/campaignBudgets:mutate`,
+    const { ok: budgetOk, status: budgetStatus, data: budgetData } = await runStage("budget", "campaignBudgets", [
       {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          operations: [
-            {
-              create: {
-                name: budgetName,
-                amountMicros,
-                deliveryMethod: "STANDARD",
-                explicitlyShared: false,
-              },
-            },
-          ],
-        }),
-      }
-    );
-
-    const { ok: budgetOk, status: budgetStatus, data: budgetData } = await safeGoogleAdsJson(budgetRes);
+        create: {
+          name: budgetName,
+          amountMicros,
+          deliveryMethod: "STANDARD",
+          explicitlyShared: false,
+        },
+      },
+    ]);
     if (!budgetOk) {
       const errMsg =
         budgetData.error?.details?.[0]?.errors?.[0]?.message ||
@@ -1650,8 +1667,14 @@ app.post("/api/google-ads/publish", async (req, res) => {
         "Error al crear el presupuesto de campaña en Google Ads.";
       return res.status(budgetStatus).json({
         success: false,
+        partialSuccess: false,
+        failedStage: "budget",
+        requestId: gadsRequestId(budgetData),
         error: `Error en Google Ads API (Budget): ${errMsg}`,
         googleDetails: budgetData.error,
+        correctionsApplied,
+        omittedItems,
+        stages: [],
       });
     }
 
@@ -1674,24 +1697,19 @@ app.post("/api/google-ads/publish", async (req, res) => {
           targetGoogleSearch: true,
           targetSearchNetwork: platformNet.searchNetwork !== false,
           targetContentNetwork: false, // Display explicitly OFF
-          targetPartnerSearchNetwork: !!platformNet.searchPartners,
+          // Partner Search Network siempre OFF: Google rechaza target_partner_search_network=true
+          // con CANNOT_TARGET_PARTNER_SEARCH_NETWORK en esta cuenta/entorno.
+          targetPartnerSearchNetwork: false,
         },
         containsEuPoliticalAdvertising: "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
       },
     };
     console.log("[Google Ads] bidding strategy:", JSON.stringify(campaignOperation.create.manualCpc));
-    const campaignRes = await fetch(
-      `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}/customers/${cleanCustomerId}/campaigns:mutate`,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          operations: [campaignOperation],
-        }),
-      }
+    const { ok: campaignOk, status: campaignStatus, data: campaignRespData } = await runStage(
+      "campaign",
+      "campaigns",
+      [campaignOperation]
     );
-
-    const { ok: campaignOk, status: campaignStatus, data: campaignRespData } = await safeGoogleAdsJson(campaignRes);
     if (!campaignOk) {
       const errMsg =
         campaignRespData.error?.details?.[0]?.errors?.[0]?.message ||
@@ -1699,8 +1717,15 @@ app.post("/api/google-ads/publish", async (req, res) => {
         "Error al crear la campaña en Google Ads.";
       return res.status(campaignStatus).json({
         success: false,
+        partialSuccess: true,
+        failedStage: "campaign",
+        requestId: gadsRequestId(campaignRespData),
         error: `Error en Google Ads API (Campaign): ${errMsg}`,
         googleDetails: campaignRespData.error,
+        budgetResourceName,
+        correctionsApplied,
+        omittedItems,
+        stages: [{ stage: "budget", attempted: true, ok: true, created: 1, failed: 0 }],
       });
     }
 
@@ -1729,13 +1754,14 @@ app.post("/api/google-ads/publish", async (req, res) => {
       fallback: string
     ) => {
       const errMsg = gadsErrorMsg(data, fallback);
-      stages.push({ stage, attempted: attempted > 0, ok: false, created: 0, failed: attempted, error: `${label}: ${errMsg}` });
+      const requestId = gadsRequestId(data);
+      stages.push({ stage, attempted: attempted > 0, ok: false, created: 0, failed: attempted, requestId, error: `${label}: ${errMsg}` });
       const partialSuccess = stages.some((s) => s.ok && s.created > 0);
       return res.status(httpStatus).json({
         success: false,
         partialSuccess,
         failedStage: stage,
-        requestId: gadsRequestId(data),
+        requestId,
         error: `Error en Google Ads API (${label}): ${errMsg}`,
         googleDetails: data?.error || null,
         customerId: cleanCustomerId,
@@ -1743,6 +1769,8 @@ app.post("/api/google-ads/publish", async (req, res) => {
         campaignResourceName,
         campaignId,
         budgetResourceName,
+        correctionsApplied,
+        omittedItems,
         stages,
       });
     };
@@ -1763,7 +1791,7 @@ app.post("/api/google-ads/publish", async (req, res) => {
       },
     }));
 
-    const { ok: agOk, status: agStatus, data: agData } = await gadsMutate("adGroups", adGroupOperations);
+    const { ok: agOk, status: agStatus, data: agData } = await runStage("adGroups", "adGroups", adGroupOperations);
     if (!agOk) {
       return failPublish("adGroups", adGroupOperations.length, agStatus, "AdGroups", agData, "Error al crear los grupos de anuncios en Google Ads.");
     }
@@ -1779,7 +1807,7 @@ app.post("/api/google-ads/publish", async (req, res) => {
       }
       stages.push({ stage: "criteria", attempted: false, ok: true, created: 0, failed: 0 });
     } else {
-      const { ok: crOk, status: crStatus, data: crData } = await gadsMutate("adGroupCriteria", criteriaOperations);
+      const { ok: crOk, status: crStatus, data: crData } = await runStage("criteria", "adGroupCriteria", criteriaOperations);
       if (!crOk) {
         return failPublish("criteria", criteriaOperations.length, crStatus, "Criteria", crData, "Error al crear keywords/negativas en Google Ads.");
       }
@@ -1792,7 +1820,7 @@ app.post("/api/google-ads/publish", async (req, res) => {
     if (adOperations.length === 0) {
       return failPublish("ads", adGroupResourceNames.length, 502, "Ads", null, "Ningún RSA de la plataforma cumplió los mínimos de Google (3 titulares + 2 descripciones).");
     }
-    const { ok: adOk, status: adStatus, data: adData } = await gadsMutate("adGroupAds", adOperations);
+    const { ok: adOk, status: adStatus, data: adData } = await runStage("ads", "adGroupAds", adOperations);
     if (!adOk) {
       return failPublish("ads", adOperations.length, adStatus, "Ads", adData, "Error al crear los anuncios RSA en Google Ads.");
     }
@@ -1803,7 +1831,8 @@ app.post("/api/google-ads/publish", async (req, res) => {
     if (assetCreates.length === 0) {
       stages.push({ stage: "assets", attempted: false, ok: true, created: 0, failed: 0 });
     } else {
-      const { ok: asOk, status: asStatus, data: asData } = await gadsMutate(
+      const { ok: asOk, status: asStatus, data: asData } = await runStage(
+        "assets",
         "assets",
         assetCreates.map((a) => a.create)
       );
@@ -1819,7 +1848,7 @@ app.post("/api/google-ads/publish", async (req, res) => {
           status: "PAUSED",
         },
       }));
-      const { ok: caOk, status: caStatus, data: caData } = await gadsMutate("campaignAsset", linkOps);
+      const { ok: caOk, status: caStatus, data: caData } = await runStage("assets", "campaignAsset", linkOps);
       if (!caOk) {
         return failPublish("assets", linkOps.length, caStatus, "CampaignAssets", caData, "Error al vincular assets (sitelinks/callouts) a la campaña.");
       }
@@ -1838,7 +1867,7 @@ app.post("/api/google-ads/publish", async (req, res) => {
         success: false,
         partialSuccess: true,
         failedStage: failed[0]?.stage || null,
-        requestId: null,
+        requestId: failed[0]?.requestId || null,
         error: `Publicación parcial en Google Ads: ${failed.map((s) => s.error || s.stage).join(" | ")}`,
         googleDetails: null,
         customerId: cleanCustomerId,
@@ -1846,6 +1875,8 @@ app.post("/api/google-ads/publish", async (req, res) => {
         campaignResourceName,
         campaignId,
         budgetResourceName,
+        correctionsApplied,
+        omittedItems,
         stages,
       });
     }
@@ -1866,12 +1897,17 @@ app.post("/api/google-ads/publish", async (req, res) => {
       message: `¡Campaña "${cleanCampaignName}" publicada con éxito en Google Ads en estado PAUSED!`,
       googleAdsUrl: `https://ads.google.com/aw/campaigns?campaignId=${campaignId}`,
       timestamp: new Date().toISOString(),
+      correctionsApplied,
+      omittedItems,
       stages,
     });
   } catch (err: any) {
     console.error("Error publishing campaign to Google Ads:", err);
     return res.status(500).json({
       success: false,
+      partialSuccess: false,
+      failedStage: null,
+      requestId: null,
       error: err.message || "Error al procesar la publicación en Google Ads.",
     });
   }

@@ -159,7 +159,7 @@ export function generateDeterministicCertifiedCampaign(brief: BriefPayload): Cam
       locationPresenceMode: "Presencia física: personas que se encuentran en tus ubicaciones objetivo (Excluye interés accidental)",
       networkSettings: {
         searchNetwork: true,
-        searchPartners: true,
+        searchPartners: false, // OFF por defecto: Google rechaza partner network (CANNOT_TARGET_PARTNER_SEARCH_NETWORK)
         displayNetwork: false, // Regla Premier Partner fundamental
       },
     },
