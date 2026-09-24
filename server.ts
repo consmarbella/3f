@@ -4,8 +4,7 @@ import { fileURLToPath } from "url";
 import "dotenv/config";
 import cookieParser from "cookie-parser";
 import { GoogleGenAI, Type } from "@google/genai";
-import { createServer as createViteServer } from "vite";
-import { generateDeterministicCertifiedCampaign } from "./src/utils/certifiedCampaignEngine.ts";
+import { generateDeterministicCertifiedCampaign } from "./src/utils/certifiedCampaignEngine.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -22,6 +21,9 @@ interface GoogleAdsSession {
   accessToken: string;
   refreshToken?: string;
   expiresAt: number;
+  // Scope con el que se consintió el token. Las sesiones creadas antes de este
+  // campo (sin scope adwords) se invalidan en getSessionFromRequest.
+  scopeKey?: string;
   userInfo?: {
     email?: string;
     name?: string;
@@ -46,15 +48,32 @@ function getSessionFromRequest(req: express.Request): GoogleAdsSession | null {
   if (!sessionId) {
     // If exactly 1 active session in memory, allow fallback for smooth single-user dev testing
     if (gadsSessions.size === 1) {
-      return gadsSessions.values().next().value || null;
+      const only = gadsSessions.values().next().value || null;
+      return only && isSessionScopeValid(only) ? only : null;
     }
     return null;
   }
-  return gadsSessions.get(sessionId) || null;
+  const session = gadsSessions.get(sessionId) || null;
+  if (session && !isSessionScopeValid(session)) {
+    // Token viejo consintido sin scope adwords (el refresh nunca amplía scopes):
+    // se invalida para forzar reautorización OAuth completa.
+    gadsSessions.delete(sessionId);
+    return null;
+  }
+  return session;
 }
 
 // Google Ads API configuration
 const GOOGLE_ADS_API_VERSION = "v25";
+
+// Scope exacto que /api/google-oauth/start solicita. Debe incluir adwords o
+// MutateCampaignBudgets responde 403 ACCESS_TOKEN_SCOPE_INSUFFICIENT.
+const REQUIRED_OAUTH_SCOPE =
+  "https://www.googleapis.com/auth/adwords openid email profile";
+
+function isSessionScopeValid(session: GoogleAdsSession): boolean {
+  return session.scopeKey === REQUIRED_OAUTH_SCOPE;
+}
 
 async function safeGoogleAdsJson(res: any): Promise<{ ok: boolean; status: number; data: any }> {
   try {
@@ -792,17 +811,20 @@ app.get("/api/google-oauth/start", (req, res) => {
       });
     }
 
-    // Determine redirect URI: prioritize requested query param, then APP_URL, then GOOGLE_ADS_REDIRECT_URI, then host
-    const queryRedirectUri = req.query.redirect_uri as string;
-    const appUrlRedirect = process.env.APP_URL ? `${process.env.APP_URL}/auth/callback` : null;
-    const envRedirect = process.env.GOOGLE_ADS_REDIRECT_URI || null;
+    // URI canónica única: GOOGLE_ADS_REDIRECT_URI (ver .env.example). Solo se acepta
+    // redirect_uri del query si coincide con la allowlist (env/APP_URL/host) para
+    // evitar redirect_uri_mismatch por typos en el frontend.
+    const queryRedirectUri = (req.query.redirect_uri as string)?.trim() || "";
+    const appUrlRedirect = process.env.APP_URL ? `${process.env.APP_URL.replace(/\/+$/, "")}/auth/callback` : null;
+    const envRedirect = (process.env.GOOGLE_ADS_REDIRECT_URI?.trim()) || "https://3f-six.vercel.app/auth/callback";
     const hostRedirect = `${req.protocol}://${req.get("host")}/auth/callback`;
 
+    const allowedRedirectUris = new Set(
+      [envRedirect, appUrlRedirect, hostRedirect].filter(Boolean) as string[]
+    );
     const redirectUri =
-      queryRedirectUri ||
-      appUrlRedirect ||
-      envRedirect ||
-      hostRedirect;
+      (queryRedirectUri && allowedRedirectUris.has(queryRedirectUri) ? queryRedirectUri : null) ||
+      envRedirect;
 
     const stateObj = {
       nonce: Math.random().toString(36).substring(2),
@@ -815,7 +837,7 @@ app.get("/api/google-oauth/start", (req, res) => {
       client_id: clientId,
       redirect_uri: redirectUri,
       response_type: "code",
-      scope: "https://www.googleapis.com/auth/adwords openid email profile",
+      scope: REQUIRED_OAUTH_SCOPE,
       access_type: "offline",
       prompt: "consent",
       include_granted_scopes: "true",
@@ -951,6 +973,7 @@ app.post("/api/google-oauth/exchange-code", async (req, res) => {
       accessToken: tokenData.access_token,
       refreshToken: tokenData.refresh_token,
       expiresAt: Date.now() + (tokenData.expires_in || 3600) * 1000,
+      scopeKey: REQUIRED_OAUTH_SCOPE,
       userInfo: userInfo
         ? { email: userInfo.email, name: userInfo.name, picture: userInfo.picture }
         : undefined,
@@ -1032,6 +1055,7 @@ app.post("/api/google-oauth/set-token", async (req, res) => {
       accessToken: finalAccessToken,
       refreshToken: finalRefreshToken || undefined,
       expiresAt,
+      scopeKey: REQUIRED_OAUTH_SCOPE,
       userInfo: userInfo
         ? { email: userInfo.email, name: userInfo.name, picture: userInfo.picture }
         : undefined,
@@ -1155,6 +1179,7 @@ const handleOAuthCallback = async (req: express.Request, res: express.Response) 
       accessToken: tokenData.access_token,
       refreshToken: tokenData.refresh_token,
       expiresAt: Date.now() + (tokenData.expires_in || 3600) * 1000,
+      scopeKey: REQUIRED_OAUTH_SCOPE,
       userInfo: userInfo
         ? { email: userInfo.email, name: userInfo.name, picture: userInfo.picture }
         : undefined,
@@ -1350,6 +1375,194 @@ app.get("/api/google-ads/accounts", async (req, res) => {
   }
 });
 
+// --- Traductor publish campaignData -> Google Ads API (etapa por etapa) ---
+// Funciones puras a nivel de módulo para poder probar el mapeo con conteos
+// reales sin llamar a Google.
+export type PublishStage = {
+  stage: "budget" | "campaign" | "adGroups" | "criteria" | "ads" | "assets";
+  attempted: boolean;
+  ok: boolean;
+  created: number;
+  failed: number;
+  error?: string;
+};
+
+export function gadsErrorMsg(data: any, fallback: string): string {
+  try {
+    const details = data?.error?.details?.[0]?.errors || [];
+    const msgs = details.map((e: any) => e.message).filter(Boolean);
+    if (msgs.length > 0) return msgs.join(" | ");
+  } catch {}
+  return data?.error?.message || fallback;
+}
+
+// requestId de Google (viene en error.details[].requestId) para soporte.
+export function gadsRequestId(data: any): string | null {
+  try {
+    const details = data?.error?.details || [];
+    for (const d of details) {
+      if (d?.requestId) return d.requestId;
+      for (const e of d?.errors || []) {
+        if (e?.requestId) return e.requestId;
+      }
+    }
+  } catch {}
+  return data?.error?.requestId || null;
+}
+
+// Notación de la plataforma: [exacta] -> EXACT, "frase" -> PHRASE,
+// resto -> BROAD; prefijo "-" -> negativa.
+export function parseCriterion(raw: any): { text: string; matchType: string; negative: boolean } | null {
+  let s = String(raw || "").trim();
+  if (!s) return null;
+  let negative = false;
+  if (s.startsWith("-")) {
+    negative = true;
+    s = s.slice(1).trim();
+  }
+  let matchType = "BROAD";
+  if (s.startsWith("[") && s.endsWith("]") && s.length >= 2) {
+    matchType = "EXACT";
+    s = s.slice(1, -1).trim();
+  } else if (s.startsWith('"') && s.endsWith('"') && s.length >= 2) {
+    matchType = "PHRASE";
+    s = s.slice(1, -1).trim();
+  }
+  if (!s) return null;
+  return { text: s.slice(0, 80), matchType, negative };
+}
+
+export function buildCriteriaOperations(
+  adGroupsToCreate: any[],
+  adGroupResourceNames: string[]
+): { operations: any[]; sourceCount: number } {
+  const operations: any[] = [];
+  let sourceCount = 0;
+  adGroupsToCreate.forEach((group: any, gi: number) => {
+    const agResource = adGroupResourceNames[gi];
+    if (!agResource) return;
+    const positives = Array.isArray(group.keywords) ? group.keywords : [];
+    const negatives = Array.isArray(group.negatives) ? group.negatives : [];
+    sourceCount += positives.length + negatives.length;
+    positives.forEach((kw: any) => {
+      const p = parseCriterion(kw);
+      if (!p) return;
+      operations.push({
+        create: {
+          adGroup: agResource,
+          // Las negativas no admiten PAUSED en Google Ads
+          status: p.negative ? "ENABLED" : "PAUSED",
+          keyword: { text: p.text, matchType: p.matchType },
+          ...(p.negative ? { negative: true } : {}),
+        },
+      });
+    });
+    negatives.forEach((kw: any) => {
+      const p = parseCriterion(kw);
+      if (!p) return;
+      operations.push({
+        create: {
+          adGroup: agResource,
+          status: "ENABLED",
+          negative: true,
+          keyword: { text: p.text, matchType: p.matchType },
+        },
+      });
+    });
+  });
+  return { operations, sourceCount };
+}
+
+export function buildAdOperations(
+  adGroupsToCreate: any[],
+  adGroupResourceNames: string[],
+  website: string
+): any[] {
+  const adOperations: any[] = [];
+  adGroupResourceNames.forEach((agResource: string, index: number) => {
+    const sourceGroup = adGroupsToCreate[index] || {};
+    const sourceAds =
+      Array.isArray(sourceGroup.ads) && sourceGroup.ads.length > 0 ? sourceGroup.ads : [];
+    sourceAds.forEach((sourceAd: any) => {
+      let cleanHeadlines: string[] = [];
+      let cleanDescriptions: string[] = [];
+
+      try {
+        const sanitized = sanitizeGoogleAdsPayload(sourceAd.headlines || [], sourceAd.descriptions || []);
+        cleanHeadlines = sanitized.cleanHeadlines;
+        cleanDescriptions = sanitized.cleanDescriptions;
+      } catch {
+        cleanHeadlines = (sourceAd.headlines || [])
+          .map((h: string) => String(h || "").slice(0, 30).trim())
+          .filter(Boolean);
+        cleanDescriptions = (sourceAd.descriptions || [])
+          .map((d: string) => String(d || "").slice(0, 90).trim())
+          .filter(Boolean);
+      }
+
+      // Mínimos exigidos por Google para un RSA: 3 titulares + 2 descripciones
+      if (cleanHeadlines.length < 3 || cleanDescriptions.length < 2) return;
+
+      adOperations.push({
+        create: {
+          adGroup: agResource,
+          status: "PAUSED",
+          ad: {
+            responsiveSearchAd: {
+              headlines: cleanHeadlines.map((text: string) => ({ text })),
+              descriptions: cleanDescriptions.map((text: string) => ({ text })),
+              path1: (sourceAd.path1 || "").slice(0, 15),
+              path2: (sourceAd.path2 || "").slice(0, 15),
+            },
+            finalUrls: [website],
+          },
+        },
+      });
+    });
+  });
+  return adOperations;
+}
+
+export function buildAssetCreates(
+  campaignData: any,
+  cleanCampaignName: string,
+  website: string
+): Array<{ kind: "SITELINK" | "CALLOUT"; create: any }> {
+  const sitelinks = Array.isArray(campaignData.sitelinks) ? campaignData.sitelinks : [];
+  const callouts = Array.isArray(campaignData.callouts) ? campaignData.callouts : [];
+  const assetCreates: Array<{ kind: "SITELINK" | "CALLOUT"; create: any }> = [];
+  sitelinks.forEach((s: any, i: number) => {
+    const linkText = String(s?.text || "").slice(0, 25).trim();
+    if (!linkText) return;
+    assetCreates.push({
+      kind: "SITELINK",
+      create: {
+        name: `Sitelink ${i + 1} ${cleanCampaignName}`.slice(0, 100),
+        type: "SITELINK",
+        sitelinkAsset: {
+          linkText,
+          description1: String(s?.description1 || "").slice(0, 35),
+          description2: String(s?.description2 || "").slice(0, 35),
+          finalUrls: [website],
+        },
+      },
+    });
+  });
+  callouts.forEach((c: any, i: number) => {
+    const calloutText = String(c || "").slice(0, 25).trim();
+    if (!calloutText) return;
+    assetCreates.push({
+      kind: "CALLOUT",
+      create: {
+        name: `Callout ${i + 1} ${cleanCampaignName}`.slice(0, 100),
+        type: "CALLOUT",
+        calloutAsset: { calloutText },
+      },
+    });
+  });
+  return assetCreates;
+}
+
 // Endpoint: /api/google-ads/publish - Real Google Ads API Mutation in PAUSED status
 app.post("/api/google-ads/publish", async (req, res) => {
   try {
@@ -1444,32 +1657,36 @@ app.post("/api/google-ads/publish", async (req, res) => {
 
     const budgetResourceName = budgetData.results?.[0]?.resourceName;
 
-    // 2. Create Campaign in PAUSED status
+    // 2. Create Campaign in PAUSED status with MANUAL_CPC (nunca Smart Bidding)
     const cleanCampaignName = `${campaignData.campaignName.slice(0, 110)} [${new Date().toISOString().slice(0, 10)}]`;
+    // Red de la plataforma; Display siempre OFF por regla Premier Partner
+    const platformNet = campaignData.settings?.networkSettings || {};
+    const campaignOperation = {
+      create: {
+        name: cleanCampaignName,
+        status: "PAUSED",
+        advertisingChannelType: "SEARCH",
+        campaignBudget: budgetResourceName,
+        manualCpc: {
+          enhancedCpcEnabled: false,
+        },
+        networkSettings: {
+          targetGoogleSearch: true,
+          targetSearchNetwork: platformNet.searchNetwork !== false,
+          targetContentNetwork: false, // Display explicitly OFF
+          targetPartnerSearchNetwork: !!platformNet.searchPartners,
+        },
+        containsEuPoliticalAdvertising: "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
+      },
+    };
+    console.log("[Google Ads] bidding strategy:", JSON.stringify(campaignOperation.create.manualCpc));
     const campaignRes = await fetch(
       `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}/customers/${cleanCustomerId}/campaigns:mutate`,
       {
         method: "POST",
         headers,
         body: JSON.stringify({
-          operations: [
-            {
-              create: {
-                name: cleanCampaignName,
-                status: "PAUSED",
-                advertisingChannelType: "SEARCH",
-                campaignBudget: budgetResourceName,
-                networkSettings: {
-                  targetGoogleSearch: true,
-                  targetSearchNetwork: true,
-                  targetContentNetwork: false, // Display explicitly OFF
-                  targetPartnerSearchNetwork: false,
-                },
-                containsEuPoliticalAdvertising: "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
-                maximizeConversions: {},
-              },
-            },
-          ],
+          operations: [campaignOperation],
         }),
       }
     );
@@ -1490,7 +1707,47 @@ app.post("/api/google-ads/publish", async (req, res) => {
     const campaignResourceName = campaignRespData.results?.[0]?.resourceName;
     const campaignId = campaignResourceName?.split("/").pop();
 
-    // 3. Create Ad Groups in PAUSED status
+    // --- Traductor campaignData -> Google Ads API: reporte por etapa ---
+    // success:true solo si TODA la estructura principal subió (req. 5).
+    const stages: PublishStage[] = [
+      { stage: "budget", attempted: true, ok: true, created: 1, failed: 0 },
+      { stage: "campaign", attempted: true, ok: true, created: 1, failed: 0 },
+    ];
+    const gadsMutate = async (service: string, operations: any[]) => {
+      const r = await fetch(
+        `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}/customers/${cleanCustomerId}/${service}:mutate`,
+        { method: "POST", headers, body: JSON.stringify({ operations }) }
+      );
+      return safeGoogleAdsJson(r);
+    };
+    const failPublish = (
+      stage: PublishStage["stage"],
+      attempted: number,
+      httpStatus: number,
+      label: string,
+      data: any,
+      fallback: string
+    ) => {
+      const errMsg = gadsErrorMsg(data, fallback);
+      stages.push({ stage, attempted: attempted > 0, ok: false, created: 0, failed: attempted, error: `${label}: ${errMsg}` });
+      const partialSuccess = stages.some((s) => s.ok && s.created > 0);
+      return res.status(httpStatus).json({
+        success: false,
+        partialSuccess,
+        failedStage: stage,
+        requestId: gadsRequestId(data),
+        error: `Error en Google Ads API (${label}): ${errMsg}`,
+        googleDetails: data?.error || null,
+        customerId: cleanCustomerId,
+        campaignName: cleanCampaignName,
+        campaignResourceName,
+        campaignId,
+        budgetResourceName,
+        stages,
+      });
+    };
+
+    // 3. Create Ad Groups in PAUSED status (uno por intención STAG de campaignData)
     const adGroupsToCreate =
       Array.isArray(campaignData.adGroups) && campaignData.adGroups.length > 0
         ? campaignData.adGroups
@@ -1502,75 +1759,104 @@ app.post("/api/google-ads/publish", async (req, res) => {
         campaign: campaignResourceName,
         status: "PAUSED",
         type: "SEARCH_STANDARD",
-        cpcBidMicros: "1500000",
+        cpcBidMicros: "1500000", // Puja manual requerida por MANUAL_CPC
       },
     }));
 
-    const adGroupsRes = await fetch(
-      `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}/customers/${cleanCustomerId}/adGroups:mutate`,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ operations: adGroupOperations }),
+    const { ok: agOk, status: agStatus, data: agData } = await gadsMutate("adGroups", adGroupOperations);
+    if (!agOk) {
+      return failPublish("adGroups", adGroupOperations.length, agStatus, "AdGroups", agData, "Error al crear los grupos de anuncios en Google Ads.");
+    }
+    const adGroupResourceNames: string[] = (agData.results || []).map((r: any) => r.resourceName);
+    stages.push({ stage: "adGroups", attempted: true, ok: true, created: adGroupResourceNames.length, failed: 0 });
+
+    // 4. Keywords + negativas de cada grupo (adGroupCriteria:mutate)
+    const { operations: criteriaOperations, sourceCount: sourceCriteriaCount } =
+      buildCriteriaOperations(adGroupsToCreate, adGroupResourceNames);
+    if (criteriaOperations.length === 0) {
+      if (sourceCriteriaCount > 0) {
+        return failPublish("criteria", sourceCriteriaCount, 502, "Criteria", null, "Ninguna keyword/negativa de la plataforma pudo mapearse a Google Ads.");
       }
-    );
-
-    const { data: adGroupsData } = await safeGoogleAdsJson(adGroupsRes);
-    const adGroupResourceNames: string[] = (adGroupsData.results || []).map((r: any) => r.resourceName);
-
-    // 4. Create Responsive Search Ads (RSA) in each Ad Group in PAUSED status
-    const adOperations: any[] = [];
-    adGroupResourceNames.forEach((agResource: string, index: number) => {
-      const sourceGroup = adGroupsToCreate[index];
-      const sourceAd = sourceGroup?.ads?.[0] || {};
-
-      let cleanHeadlines: string[] = [];
-      let cleanDescriptions: string[] = [];
-
-      try {
-        const sanitized = sanitizeGoogleAdsPayload(sourceAd.headlines || [], sourceAd.descriptions || []);
-        cleanHeadlines = sanitized.cleanHeadlines;
-        cleanDescriptions = sanitized.cleanDescriptions;
-      } catch {
-        cleanHeadlines = (sourceAd.headlines || ["Servicios Profesionales", "Atención Inmediata", "Garantía y Calidad"])
-          .map((h: string) => String(h || "").slice(0, 30).trim())
-          .filter(Boolean);
-        cleanDescriptions = (sourceAd.descriptions || ["Contáctanos hoy para más información y cotizaciones.", "Profesionales certificados a tu disposición 24/7."])
-          .map((d: string) => String(d || "").slice(0, 90).trim())
-          .filter(Boolean);
+      stages.push({ stage: "criteria", attempted: false, ok: true, created: 0, failed: 0 });
+    } else {
+      const { ok: crOk, status: crStatus, data: crData } = await gadsMutate("adGroupCriteria", criteriaOperations);
+      if (!crOk) {
+        return failPublish("criteria", criteriaOperations.length, crStatus, "Criteria", crData, "Error al crear keywords/negativas en Google Ads.");
       }
+      stages.push({ stage: "criteria", attempted: true, ok: true, created: (crData.results || []).length, failed: 0 });
+    }
 
-      adOperations.push({
+    // 5. RSA: TODOS los ads generados por cada grupo (no solo el primero)
+    const website = String(campaignData.website || "https://google.com");
+    const adOperations: any[] = buildAdOperations(adGroupsToCreate, adGroupResourceNames, website);
+    if (adOperations.length === 0) {
+      return failPublish("ads", adGroupResourceNames.length, 502, "Ads", null, "Ningún RSA de la plataforma cumplió los mínimos de Google (3 titulares + 2 descripciones).");
+    }
+    const { ok: adOk, status: adStatus, data: adData } = await gadsMutate("adGroupAds", adOperations);
+    if (!adOk) {
+      return failPublish("ads", adOperations.length, adStatus, "Ads", adData, "Error al crear los anuncios RSA en Google Ads.");
+    }
+    stages.push({ stage: "ads", attempted: true, ok: true, created: (adData.results || []).length, failed: 0 });
+
+    // 6. Assets: sitelinks + callouts de la plataforma -> assets + campaignAsset
+    const assetCreates = buildAssetCreates(campaignData, cleanCampaignName, website);
+    if (assetCreates.length === 0) {
+      stages.push({ stage: "assets", attempted: false, ok: true, created: 0, failed: 0 });
+    } else {
+      const { ok: asOk, status: asStatus, data: asData } = await gadsMutate(
+        "assets",
+        assetCreates.map((a) => a.create)
+      );
+      if (!asOk) {
+        return failPublish("assets", assetCreates.length, asStatus, "Assets", asData, "Error al crear assets (sitelinks/callouts) en Google Ads.");
+      }
+      const assetResources: string[] = (asData.results || []).map((r: any) => r.resourceName);
+      const linkOps = assetResources.map((ar: string, i: number) => ({
         create: {
-          adGroup: agResource,
+          campaign: campaignResourceName,
+          asset: ar,
+          fieldType: assetCreates[i].kind,
           status: "PAUSED",
-          ad: {
-            responsiveSearchAd: {
-              headlines: cleanHeadlines.map((text: string) => ({ text })),
-              descriptions: cleanDescriptions.map((text: string) => ({ text })),
-              path1: (sourceAd.path1 || "").slice(0, 15),
-              path2: (sourceAd.path2 || "").slice(0, 15),
-            },
-            finalUrls: [campaignData.website || "https://google.com"],
-          },
         },
-      });
-    });
+      }));
+      const { ok: caOk, status: caStatus, data: caData } = await gadsMutate("campaignAsset", linkOps);
+      if (!caOk) {
+        return failPublish("assets", linkOps.length, caStatus, "CampaignAssets", caData, "Error al vincular assets (sitelinks/callouts) a la campaña.");
+      }
+      stages.push({ stage: "assets", attempted: true, ok: true, created: assetResources.length, failed: 0 });
+    }
 
-    if (adOperations.length > 0) {
-      await fetch(
-        `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}/customers/${cleanCustomerId}/adGroupAds:mutate`,
-        {
-          method: "POST",
-          headers,
-          body: JSON.stringify({ operations: adOperations }),
-        }
-      ).catch((err) => console.warn("Notice: adGroupAds mutate notice:", err));
+    // Éxito solo si TODA la estructura principal subió (req. 5): sin éxito falso.
+    const mainStages: Array<PublishStage["stage"]> = ["budget", "campaign", "adGroups", "criteria", "ads"];
+    const mainOk = mainStages.every(
+      (m) => stages.find((s) => s.stage === m)?.attempted && stages.find((s) => s.stage === m)?.ok
+    );
+    const allOk = stages.filter((s) => s.attempted).every((s) => s.ok);
+    if (!mainOk || !allOk) {
+      const failed = stages.filter((s) => s.attempted && !s.ok);
+      return res.status(502).json({
+        success: false,
+        partialSuccess: true,
+        failedStage: failed[0]?.stage || null,
+        requestId: null,
+        error: `Publicación parcial en Google Ads: ${failed.map((s) => s.error || s.stage).join(" | ")}`,
+        googleDetails: null,
+        customerId: cleanCustomerId,
+        campaignName: cleanCampaignName,
+        campaignResourceName,
+        campaignId,
+        budgetResourceName,
+        stages,
+      });
     }
 
     return res.json({
       success: true,
+      partialSuccess: false,
+      failedStage: null,
+      requestId: null,
       status: "PAUSED",
+      bidding: "MANUAL_CPC",
       customerId: cleanCustomerId,
       campaignName: cleanCampaignName,
       campaignResourceName,
@@ -1580,6 +1866,7 @@ app.post("/api/google-ads/publish", async (req, res) => {
       message: `¡Campaña "${cleanCampaignName}" publicada con éxito en Google Ads en estado PAUSED!`,
       googleAdsUrl: `https://ads.google.com/aw/campaigns?campaignId=${campaignId}`,
       timestamp: new Date().toISOString(),
+      stages,
     });
   } catch (err: any) {
     console.error("Error publishing campaign to Google Ads:", err);
@@ -1595,6 +1882,8 @@ async function startServer() {
     return;
   }
   if (process.env.NODE_ENV !== "production") {
+    // Lazy-load vite solo en dev local: import estático revienta el bundle serverless de Vercel (FUNCTION_INVOCATION_FAILED)
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",

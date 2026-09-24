@@ -78,6 +78,7 @@ export interface CampaignStrategy {
   strategicRationale: string;
   culturalAnalysis?: string;
   language: string;
+  website?: string; // finalUrls de RSA y sitelinks en publish
   settings: CampaignSettings;
   sitelinks: Sitelink[];
   callouts: string[];

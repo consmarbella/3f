@@ -145,6 +145,7 @@ export function generateDeterministicCertifiedCampaign(brief: BriefPayload): Cam
 
   return {
     campaignName: `Search - ${name} - ${product} [STAG Certified]`,
+    website: brief.website?.trim() || undefined,
     campaignGoal: goal,
     campaignOverview: `Estrategia de Google Ads Search Single-Theme Ad Groups (STAG) diseñada para captar demanda de alta intención para ${name}. Optimiza el presupuesto de $${budget}/día desactivando la Red de Display y aislando concordancias para maximizar el ROI.`,
     strategicRationale: `1. Arquitectura STAG dividida en 3 intenciones clave (Urgencia/Transaccional, Comparativa/Comercial y Cobertura Local). 2. Ofertas inteligentes basadas en Maximizar Conversiones para nutrir el Smart Bidding. 3. Bóveda proactiva de ${allNegatives.length} palabras clave negativas para proteger entre un 35% y un 42% del presupuesto contra clics basura.`,

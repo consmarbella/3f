@@ -269,13 +269,17 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
   };
 
   const getTargetRedirectUri = (): string => {
+    // Canónica: debe coincidir con GOOGLE_ADS_REDIRECT_URI del backend y con
+    // la URI registrada en Google Cloud Console. Se normaliza sin trailing slash.
+    let uri: string;
     if (redirectOption === "vercel") {
-      return "https://3f-six.vercel.app/auth/callback";
+      uri = "https://3f-six.vercel.app/auth/callback";
+    } else if (redirectOption === "custom" && customRedirectUri.trim()) {
+      uri = customRedirectUri.trim();
+    } else {
+      uri = `${window.location.origin}/auth/callback`;
     }
-    if (redirectOption === "custom" && customRedirectUri.trim()) {
-      return customRedirectUri.trim();
-    }
-    return `${window.location.origin}/auth/callback`;
+    return uri.replace(/\/+$/, "");
   };
 
   const copyToClipboard = (text: string) => {
@@ -427,14 +431,11 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
   };
 
   const handlePublish = async () => {
-    const manualClean = manualCustomerId.replace(/[^0-9]/g, "");
-    const selectedClean = selectedCustomerId.replace(/[^0-9]/g, "");
-    const finalCustomerId =
-      manualClean && manualClean.length >= 8
-        ? manualClean
-        : selectedClean && selectedClean.length >= 8
-        ? selectedClean
-        : manualClean || selectedClean;
+    // Fuente única: misma fórmula que effectiveCustomerId (línea ~506) para que
+    // el debug "Listo para publicar" y el payload nunca diverjan.
+    const normalizedManualId = manualCustomerId.replace(/[^0-9]/g, "");
+    const normalizedSelectedId = selectedCustomerId.replace(/[^0-9]/g, "");
+    const finalCustomerId = isManualInput ? normalizedManualId : (normalizedSelectedId || normalizedManualId);
 
     if (!finalCustomerId || finalCustomerId.length < 8) {
       setPublishError("Por favor ingresa o selecciona un Customer ID válido de Google Ads (10 dígitos).");
