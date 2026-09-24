@@ -5,7 +5,8 @@ import "dotenv/config";
 import cookieParser from "cookie-parser";
 import { GoogleGenAI, Type } from "@google/genai";
 import { generateDeterministicCertifiedCampaign } from "./src/utils/certifiedCampaignEngine.js";
-import { normalizeCampaignData, matchRetryFix } from "./src/utils/googleAdsCompat.js";
+import { matchRetryFix } from "./src/utils/googleAdsCompat.js";
+import { adaptCampaignForManualSearch } from "./src/utils/googleAdsManualSearchAdapter.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1412,158 +1413,10 @@ export function gadsRequestId(data: any): string | null {
   return data?.error?.requestId || null;
 }
 
-// Notación de la plataforma: [exacta] -> EXACT, "frase" -> PHRASE,
-// resto -> BROAD; prefijo "-" -> negativa.
-export function parseCriterion(raw: any): { text: string; matchType: string; negative: boolean } | null {
-  let s = String(raw || "").trim();
-  if (!s) return null;
-  let negative = false;
-  if (s.startsWith("-")) {
-    negative = true;
-    s = s.slice(1).trim();
-  }
-  let matchType = "BROAD";
-  if (s.startsWith("[") && s.endsWith("]") && s.length >= 2) {
-    matchType = "EXACT";
-    s = s.slice(1, -1).trim();
-  } else if (s.startsWith('"') && s.endsWith('"') && s.length >= 2) {
-    matchType = "PHRASE";
-    s = s.slice(1, -1).trim();
-  }
-  if (!s) return null;
-  return { text: s.slice(0, 80), matchType, negative };
-}
+// (Movidos a src/utils/googleAdsCompat.ts: parseCriterion, buildCriteriaOperations,
+// buildAdOperations, buildAssetCreates — única fuente del mapeo)
 
-export function buildCriteriaOperations(
-  adGroupsToCreate: any[],
-  adGroupResourceNames: string[]
-): { operations: any[]; sourceCount: number } {
-  const operations: any[] = [];
-  let sourceCount = 0;
-  adGroupsToCreate.forEach((group: any, gi: number) => {
-    const agResource = adGroupResourceNames[gi];
-    if (!agResource) return;
-    const positives = Array.isArray(group.keywords) ? group.keywords : [];
-    const negatives = Array.isArray(group.negatives) ? group.negatives : [];
-    sourceCount += positives.length + negatives.length;
-    positives.forEach((kw: any) => {
-      const p = parseCriterion(kw);
-      if (!p) return;
-      operations.push({
-        create: {
-          adGroup: agResource,
-          // Las negativas no admiten PAUSED en Google Ads
-          status: p.negative ? "ENABLED" : "PAUSED",
-          keyword: { text: p.text, matchType: p.matchType },
-          ...(p.negative ? { negative: true } : {}),
-        },
-      });
-    });
-    negatives.forEach((kw: any) => {
-      const p = parseCriterion(kw);
-      if (!p) return;
-      operations.push({
-        create: {
-          adGroup: agResource,
-          status: "ENABLED",
-          negative: true,
-          keyword: { text: p.text, matchType: p.matchType },
-        },
-      });
-    });
-  });
-  return { operations, sourceCount };
-}
-
-export function buildAdOperations(
-  adGroupsToCreate: any[],
-  adGroupResourceNames: string[],
-  website: string
-): any[] {
-  const adOperations: any[] = [];
-  adGroupResourceNames.forEach((agResource: string, index: number) => {
-    const sourceGroup = adGroupsToCreate[index] || {};
-    const sourceAds =
-      Array.isArray(sourceGroup.ads) && sourceGroup.ads.length > 0 ? sourceGroup.ads : [];
-    sourceAds.forEach((sourceAd: any) => {
-      let cleanHeadlines: string[] = [];
-      let cleanDescriptions: string[] = [];
-
-      try {
-        const sanitized = sanitizeGoogleAdsPayload(sourceAd.headlines || [], sourceAd.descriptions || []);
-        cleanHeadlines = sanitized.cleanHeadlines;
-        cleanDescriptions = sanitized.cleanDescriptions;
-      } catch {
-        cleanHeadlines = (sourceAd.headlines || [])
-          .map((h: string) => String(h || "").slice(0, 30).trim())
-          .filter(Boolean);
-        cleanDescriptions = (sourceAd.descriptions || [])
-          .map((d: string) => String(d || "").slice(0, 90).trim())
-          .filter(Boolean);
-      }
-
-      // Mínimos exigidos por Google para un RSA: 3 titulares + 2 descripciones
-      if (cleanHeadlines.length < 3 || cleanDescriptions.length < 2) return;
-
-      adOperations.push({
-        create: {
-          adGroup: agResource,
-          status: "PAUSED",
-          ad: {
-            responsiveSearchAd: {
-              headlines: cleanHeadlines.map((text: string) => ({ text })),
-              descriptions: cleanDescriptions.map((text: string) => ({ text })),
-              path1: (sourceAd.path1 || "").slice(0, 15),
-              path2: (sourceAd.path2 || "").slice(0, 15),
-            },
-            finalUrls: [website],
-          },
-        },
-      });
-    });
-  });
-  return adOperations;
-}
-
-export function buildAssetCreates(
-  campaignData: any,
-  cleanCampaignName: string,
-  website: string
-): Array<{ kind: "SITELINK" | "CALLOUT"; create: any }> {
-  const sitelinks = Array.isArray(campaignData.sitelinks) ? campaignData.sitelinks : [];
-  const callouts = Array.isArray(campaignData.callouts) ? campaignData.callouts : [];
-  const assetCreates: Array<{ kind: "SITELINK" | "CALLOUT"; create: any }> = [];
-  sitelinks.forEach((s: any, i: number) => {
-    const linkText = String(s?.text || "").slice(0, 25).trim();
-    if (!linkText) return;
-    assetCreates.push({
-      kind: "SITELINK",
-      create: {
-        name: `Sitelink ${i + 1} ${cleanCampaignName}`.slice(0, 100),
-        type: "SITELINK",
-        sitelinkAsset: {
-          linkText,
-          description1: String(s?.description1 || "").slice(0, 35),
-          description2: String(s?.description2 || "").slice(0, 35),
-          finalUrls: [website],
-        },
-      },
-    });
-  });
-  callouts.forEach((c: any, i: number) => {
-    const calloutText = String(c || "").slice(0, 25).trim();
-    if (!calloutText) return;
-    assetCreates.push({
-      kind: "CALLOUT",
-      create: {
-        name: `Callout ${i + 1} ${cleanCampaignName}`.slice(0, 100),
-        type: "CALLOUT",
-        calloutAsset: { calloutText },
-      },
-    });
-  });
-  return assetCreates;
-}
+// (buildAdOperations y buildAssetCreates también viven en googleAdsCompat.ts)
 
 // Endpoint: /api/google-ads/publish - Real Google Ads API Mutation in PAUSED status
 app.post("/api/google-ads/publish", async (req, res) => {
@@ -1619,12 +1472,26 @@ app.post("/api/google-ads/publish", async (req, res) => {
       headers["login-customer-id"] = process.env.GOOGLE_ADS_LOGIN_CUSTOMER_ID.replace(/[^0-9]/g, "");
     }
 
-    // 0. Compatibility Layer: preflight normalization de campaignData
-    // (bids, límites, mínimos RSA, match types, MANUAL_CPC, Display/Partners OFF)
-    const compatReport = normalizeCampaignData(campaignData);
-    campaignData = compatReport.data;
-    const correctionsApplied = compatReport.correctionsApplied;
-    const omittedItems = compatReport.omittedItems;
+    // 0. GoogleAdsManualSearchAdapter: spec fija Manual Search derivada de la
+    // documentación oficial (contrato permanente). Traduce campaignData
+    // completo a operaciones válidas + correcciones/omisiones.
+    const plan = adaptCampaignForManualSearch(campaignData);
+    campaignData = plan.normalized;
+    const correctionsApplied = plan.correctionsApplied;
+    const omittedItems = plan.omittedItems;
+    const cleanCampaignName = plan.campaignName;
+    const website = plan.website;
+    const adGroupsToCreate = plan.adGroupsToCreate;
+
+    // Definida como function (hoisted) y ANTES del primer uso: runStage la
+    // invoca en la etapa budget; como const quedaba en TDZ hasta la línea 1741.
+    async function gadsMutate(service: string, operations: any[]) {
+      const r = await fetch(
+        `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}/customers/${cleanCustomerId}/${service}:mutate`,
+        { method: "POST", headers, body: JSON.stringify({ operations }) }
+      );
+      return safeGoogleAdsJson(r);
+    }
 
     // Safe retry por etapa: ante error conocido, corrige y reintenta UNA vez
     const runStage = async (stageName: string, service: string, operations: any[]) => {
@@ -1645,21 +1512,12 @@ app.post("/api/google-ads/publish", async (req, res) => {
       return r;
     };
 
-    // 1. Create Campaign Budget (monto ya normalizado: >= 1 unidad de moneda)
-    const dailyBudget = Number(campaignData.settings?.dailyBudget) || 25;
-    const amountMicros = String(Math.round(dailyBudget * 1000000));
-    const budgetName = `Presupuesto ${campaignData.campaignName.slice(0, 45)} [${Date.now().toString().slice(-6)}]`;
-
-    const { ok: budgetOk, status: budgetStatus, data: budgetData } = await runStage("budget", "campaignBudgets", [
-      {
-        create: {
-          name: budgetName,
-          amountMicros,
-          deliveryMethod: "STANDARD",
-          explicitlyShared: false,
-        },
-      },
-    ]);
+    // 1. CampaignBudget válido según spec (monto normalizado >= 1 unidad)
+    const { ok: budgetOk, status: budgetStatus, data: budgetData } = await runStage(
+      "budget",
+      "campaignBudgets",
+      plan.budgetOperations
+    );
     if (!budgetOk) {
       const errMsg =
         budgetData.error?.details?.[0]?.errors?.[0]?.message ||
@@ -1680,30 +1538,8 @@ app.post("/api/google-ads/publish", async (req, res) => {
 
     const budgetResourceName = budgetData.results?.[0]?.resourceName;
 
-    // 2. Create Campaign in PAUSED status with MANUAL_CPC (nunca Smart Bidding)
-    const cleanCampaignName = `${campaignData.campaignName.slice(0, 110)} [${new Date().toISOString().slice(0, 10)}]`;
-    // Red de la plataforma; Display siempre OFF por regla Premier Partner
-    const platformNet = campaignData.settings?.networkSettings || {};
-    const campaignOperation = {
-      create: {
-        name: cleanCampaignName,
-        status: "PAUSED",
-        advertisingChannelType: "SEARCH",
-        campaignBudget: budgetResourceName,
-        manualCpc: {
-          enhancedCpcEnabled: false,
-        },
-        networkSettings: {
-          targetGoogleSearch: true,
-          targetSearchNetwork: platformNet.searchNetwork !== false,
-          targetContentNetwork: false, // Display explicitly OFF
-          // Partner Search Network siempre OFF: Google rechaza target_partner_search_network=true
-          // con CANNOT_TARGET_PARTNER_SEARCH_NETWORK en esta cuenta/entorno.
-          targetPartnerSearchNetwork: false,
-        },
-        containsEuPoliticalAdvertising: "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
-      },
-    };
+    // 2. Campaign SEARCH + PAUSED + Manual CPC según spec (nunca Smart Bidding)
+    const campaignOperation = plan.buildCampaignOperation(budgetResourceName);
     console.log("[Google Ads] bidding strategy:", JSON.stringify(campaignOperation.create.manualCpc));
     const { ok: campaignOk, status: campaignStatus, data: campaignRespData } = await runStage(
       "campaign",
@@ -1738,13 +1574,6 @@ app.post("/api/google-ads/publish", async (req, res) => {
       { stage: "budget", attempted: true, ok: true, created: 1, failed: 0 },
       { stage: "campaign", attempted: true, ok: true, created: 1, failed: 0 },
     ];
-    const gadsMutate = async (service: string, operations: any[]) => {
-      const r = await fetch(
-        `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}/customers/${cleanCustomerId}/${service}:mutate`,
-        { method: "POST", headers, body: JSON.stringify({ operations }) }
-      );
-      return safeGoogleAdsJson(r);
-    };
     const failPublish = (
       stage: PublishStage["stage"],
       attempted: number,
@@ -1775,21 +1604,8 @@ app.post("/api/google-ads/publish", async (req, res) => {
       });
     };
 
-    // 3. Create Ad Groups in PAUSED status (uno por intención STAG de campaignData)
-    const adGroupsToCreate =
-      Array.isArray(campaignData.adGroups) && campaignData.adGroups.length > 0
-        ? campaignData.adGroups
-        : [{ name: "Grupo Principal - Search", ads: [] }];
-
-    const adGroupOperations = adGroupsToCreate.map((group: any, idx: number) => ({
-      create: {
-        name: `${group.name || `Grupo de Anuncios ${idx + 1}`}`.slice(0, 100),
-        campaign: campaignResourceName,
-        status: "PAUSED",
-        type: "SEARCH_STANDARD",
-        cpcBidMicros: "1500000", // Puja manual requerida por MANUAL_CPC
-      },
-    }));
+    // 3. AdGroups válidos según spec (uno por intención STAG)
+    const adGroupOperations = plan.buildAdGroupOperations(campaignResourceName);
 
     const { ok: agOk, status: agStatus, data: agData } = await runStage("adGroups", "adGroups", adGroupOperations);
     if (!agOk) {
@@ -1798,9 +1614,9 @@ app.post("/api/google-ads/publish", async (req, res) => {
     const adGroupResourceNames: string[] = (agData.results || []).map((r: any) => r.resourceName);
     stages.push({ stage: "adGroups", attempted: true, ok: true, created: adGroupResourceNames.length, failed: 0 });
 
-    // 4. Keywords + negativas de cada grupo (adGroupCriteria:mutate)
+    // 4. AdGroupCriteria válidos para keywords (spec: EXACT/PHRASE/BROAD)
     const { operations: criteriaOperations, sourceCount: sourceCriteriaCount } =
-      buildCriteriaOperations(adGroupsToCreate, adGroupResourceNames);
+      plan.buildCriteriaOperationsFor(adGroupResourceNames);
     if (criteriaOperations.length === 0) {
       if (sourceCriteriaCount > 0) {
         return failPublish("criteria", sourceCriteriaCount, 502, "Criteria", null, "Ninguna keyword/negativa de la plataforma pudo mapearse a Google Ads.");
@@ -1814,9 +1630,8 @@ app.post("/api/google-ads/publish", async (req, res) => {
       stages.push({ stage: "criteria", attempted: true, ok: true, created: (crData.results || []).length, failed: 0 });
     }
 
-    // 5. RSA: TODOS los ads generados por cada grupo (no solo el primero)
-    const website = String(campaignData.website || "https://google.com");
-    const adOperations: any[] = buildAdOperations(adGroupsToCreate, adGroupResourceNames, website);
+    // 5. AdGroupAds válidos tipo RSA (spec: 3+ headlines, 2+ descripciones, final URL)
+    const adOperations: any[] = plan.buildAdOperationsFor(adGroupResourceNames);
     if (adOperations.length === 0) {
       return failPublish("ads", adGroupResourceNames.length, 502, "Ads", null, "Ningún RSA de la plataforma cumplió los mínimos de Google (3 titulares + 2 descripciones).");
     }
@@ -1827,7 +1642,7 @@ app.post("/api/google-ads/publish", async (req, res) => {
     stages.push({ stage: "ads", attempted: true, ok: true, created: (adData.results || []).length, failed: 0 });
 
     // 6. Assets: sitelinks + callouts de la plataforma -> assets + campaignAsset
-    const assetCreates = buildAssetCreates(campaignData, cleanCampaignName, website);
+    const assetCreates = plan.assetCreates;
     if (assetCreates.length === 0) {
       stages.push({ stage: "assets", attempted: false, ok: true, created: 0, failed: 0 });
     } else {

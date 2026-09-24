@@ -239,3 +239,184 @@ export function matchRetryFix(service: string, operations: any[], data: any): st
 
   return null;
 }
+
+// --- Builders campaignData -> operaciones Google Ads API (spec Manual Search) ---
+
+/**
+ * Corta al límite exacto de Google Ads (30 titulares / 90 descripciones).
+ * Lanza si no hay mínimos RSA (3 + 2).
+ */
+export function sanitizeGoogleAdsPayload(
+  headlines: string[],
+  descriptions: string[]
+): { cleanHeadlines: string[]; cleanDescriptions: string[] } {
+  const cleanHeadlines = (headlines || [])
+    .map((h) => (typeof h === "string" ? h.slice(0, 30).trim() : ""))
+    .filter((h) => h.length > 0);
+
+  const cleanDescriptions = (descriptions || [])
+    .map((d) => (typeof d === "string" ? d.slice(0, 90).trim() : ""))
+    .filter((d) => d.length > 0);
+
+  if (cleanHeadlines.length < 3) {
+    throw new Error("Se requieren al menos 3 titulares válidos.");
+  }
+  if (cleanDescriptions.length < 2) {
+    throw new Error("Se requieren al menos 2 descripciones válidas.");
+  }
+
+  return { cleanHeadlines, cleanDescriptions };
+}
+
+// Notación de la plataforma: [exacta] -> EXACT, "frase" -> PHRASE,
+// resto -> BROAD; prefijo "-" -> negativa.
+export function parseCriterion(raw: any): { text: string; matchType: string; negative: boolean } | null {
+  let s = String(raw || "").trim();
+  if (!s) return null;
+  let negative = false;
+  if (s.startsWith("-")) {
+    negative = true;
+    s = s.slice(1).trim();
+  }
+  let matchType = "BROAD";
+  if (s.startsWith("[") && s.endsWith("]") && s.length >= 2) {
+    matchType = "EXACT";
+    s = s.slice(1, -1).trim();
+  } else if (s.startsWith('"') && s.endsWith('"') && s.length >= 2) {
+    matchType = "PHRASE";
+    s = s.slice(1, -1).trim();
+  }
+  if (!s) return null;
+  return { text: s.slice(0, 80), matchType, negative };
+}
+
+export function buildCriteriaOperations(
+  adGroupsToCreate: any[],
+  adGroupResourceNames: string[]
+): { operations: any[]; sourceCount: number } {
+  const operations: any[] = [];
+  let sourceCount = 0;
+  adGroupsToCreate.forEach((group: any, gi: number) => {
+    const agResource = adGroupResourceNames[gi];
+    if (!agResource) return;
+    const positives = Array.isArray(group.keywords) ? group.keywords : [];
+    const negatives = Array.isArray(group.negatives) ? group.negatives : [];
+    sourceCount += positives.length + negatives.length;
+    positives.forEach((kw: any) => {
+      const p = parseCriterion(kw);
+      if (!p) return;
+      operations.push({
+        create: {
+          adGroup: agResource,
+          // Las negativas no admiten PAUSED en Google Ads
+          status: p.negative ? "ENABLED" : "PAUSED",
+          keyword: { text: p.text, matchType: p.matchType },
+          ...(p.negative ? { negative: true } : {}),
+        },
+      });
+    });
+    negatives.forEach((kw: any) => {
+      const p = parseCriterion(kw);
+      if (!p) return;
+      operations.push({
+        create: {
+          adGroup: agResource,
+          status: "ENABLED",
+          negative: true,
+          keyword: { text: p.text, matchType: p.matchType },
+        },
+      });
+    });
+  });
+  return { operations, sourceCount };
+}
+
+export function buildAdOperations(
+  adGroupsToCreate: any[],
+  adGroupResourceNames: string[],
+  website: string
+): any[] {
+  const adOperations: any[] = [];
+  adGroupResourceNames.forEach((agResource: string, index: number) => {
+    const sourceGroup = adGroupsToCreate[index] || {};
+    const sourceAds =
+      Array.isArray(sourceGroup.ads) && sourceGroup.ads.length > 0 ? sourceGroup.ads : [];
+    sourceAds.forEach((sourceAd: any) => {
+      let cleanHeadlines: string[] = [];
+      let cleanDescriptions: string[] = [];
+
+      try {
+        const sanitized = sanitizeGoogleAdsPayload(sourceAd.headlines || [], sourceAd.descriptions || []);
+        cleanHeadlines = sanitized.cleanHeadlines;
+        cleanDescriptions = sanitized.cleanDescriptions;
+      } catch {
+        cleanHeadlines = (sourceAd.headlines || [])
+          .map((h: string) => String(h || "").slice(0, 30).trim())
+          .filter(Boolean);
+        cleanDescriptions = (sourceAd.descriptions || [])
+          .map((d: string) => String(d || "").slice(0, 90).trim())
+          .filter(Boolean);
+      }
+
+      // Mínimos exigidos por Google para un RSA: 3 titulares + 2 descripciones
+      if (cleanHeadlines.length < 3 || cleanDescriptions.length < 2) return;
+
+      adOperations.push({
+        create: {
+          adGroup: agResource,
+          status: "PAUSED",
+          ad: {
+            responsiveSearchAd: {
+              headlines: cleanHeadlines.map((text: string) => ({ text })),
+              descriptions: cleanDescriptions.map((text: string) => ({ text })),
+              path1: (sourceAd.path1 || "").slice(0, 15),
+              path2: (sourceAd.path2 || "").slice(0, 15),
+            },
+            finalUrls: [website],
+          },
+        },
+      });
+    });
+  });
+  return adOperations;
+}
+
+export function buildAssetCreates(
+  campaignData: any,
+  cleanCampaignName: string,
+  website: string
+): Array<{ kind: "SITELINK" | "CALLOUT"; create: any }> {
+  const sitelinks = Array.isArray(campaignData.sitelinks) ? campaignData.sitelinks : [];
+  const callouts = Array.isArray(campaignData.callouts) ? campaignData.callouts : [];
+  const assetCreates: Array<{ kind: "SITELINK" | "CALLOUT"; create: any }> = [];
+  sitelinks.forEach((s: any, i: number) => {
+    const linkText = String(s?.text || "").slice(0, 25).trim();
+    if (!linkText) return;
+    assetCreates.push({
+      kind: "SITELINK",
+      create: {
+        name: `Sitelink ${i + 1} ${cleanCampaignName}`.slice(0, 100),
+        type: "SITELINK",
+        sitelinkAsset: {
+          linkText,
+          description1: String(s?.description1 || "").slice(0, 35),
+          description2: String(s?.description2 || "").slice(0, 35),
+          finalUrls: [website],
+        },
+      },
+    });
+  });
+  callouts.forEach((c: any, i: number) => {
+    const calloutText = String(c || "").slice(0, 25).trim();
+    if (!calloutText) return;
+    assetCreates.push({
+      kind: "CALLOUT",
+      create: {
+        name: `Callout ${i + 1} ${cleanCampaignName}`.slice(0, 100),
+        type: "CALLOUT",
+        calloutAsset: { calloutText },
+      },
+    });
+  });
+  return assetCreates;
+}
