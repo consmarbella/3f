@@ -763,10 +763,17 @@ app.get("/api/google-oauth/start", (req, res) => {
       });
     }
 
+    // Determine redirect URI: prioritize requested query param, then APP_URL, then GOOGLE_ADS_REDIRECT_URI, then host
+    const queryRedirectUri = req.query.redirect_uri as string;
+    const appUrlRedirect = process.env.APP_URL ? `${process.env.APP_URL}/auth/callback` : null;
+    const envRedirect = process.env.GOOGLE_ADS_REDIRECT_URI || null;
+    const hostRedirect = `${req.protocol}://${req.get("host")}/auth/callback`;
+
     const redirectUri =
-      process.env.GOOGLE_ADS_REDIRECT_URI ||
-      (req.query.redirect_uri as string) ||
-      `${req.protocol}://${req.get("host")}/auth/callback`;
+      queryRedirectUri ||
+      appUrlRedirect ||
+      envRedirect ||
+      hostRedirect;
 
     const stateObj = {
       nonce: Math.random().toString(36).substring(2),
@@ -789,10 +796,231 @@ app.get("/api/google-oauth/start", (req, res) => {
     const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
 
     if (req.query.json === "true" || req.headers.accept?.includes("application/json")) {
-      return res.json({ success: true, url: authUrl, redirectUri });
+      return res.json({
+        success: true,
+        url: authUrl,
+        redirectUri,
+        availableRedirectUris: {
+          appUrl: appUrlRedirect,
+          envConfigured: envRedirect,
+          hostUrl: hostRedirect,
+          customVercel: "https://3f-six.vercel.app/auth/callback",
+        },
+      });
     }
 
     return res.redirect(authUrl);
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Endpoint: Manual authorization code / URL exchange (Fallback for 404 pages or blocked popups)
+app.post("/api/google-oauth/exchange-code", async (req, res) => {
+  try {
+    let { code, redirectUri, rawUrl } = req.body;
+
+    if (rawUrl) {
+      try {
+        const parsed = new URL(rawUrl.trim());
+        const extractedCode = parsed.searchParams.get("code");
+        if (extractedCode) code = extractedCode;
+
+        const stateParam = parsed.searchParams.get("state");
+        if (stateParam && !redirectUri) {
+          try {
+            const decoded = JSON.parse(Buffer.from(stateParam, "base64").toString("utf-8"));
+            if (decoded.redirectUri) redirectUri = decoded.redirectUri;
+          } catch {}
+        }
+      } catch {}
+    }
+
+    if (!code || typeof code !== "string" || !code.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: "Por favor proporciona un código de autorización o la URL completa con '?code=' generada por Google.",
+      });
+    }
+
+    const cleanCode = code.trim();
+    const clientId = process.env.GOOGLE_ADS_CLIENT_ID;
+    const clientSecret = process.env.GOOGLE_ADS_CLIENT_SECRET;
+
+    if (!clientId || !clientSecret) {
+      return res.status(400).json({
+        success: false,
+        error: "Falta GOOGLE_ADS_CLIENT_ID o GOOGLE_ADS_CLIENT_SECRET en las variables de entorno del backend.",
+      });
+    }
+
+    // Try multiple possible redirect URIs in order to maximize success
+    const candidateUris: string[] = [];
+    if (redirectUri) candidateUris.push(redirectUri.trim());
+    if (process.env.APP_URL) candidateUris.push(`${process.env.APP_URL}/auth/callback`);
+    if (process.env.GOOGLE_ADS_REDIRECT_URI) candidateUris.push(process.env.GOOGLE_ADS_REDIRECT_URI.trim());
+    candidateUris.push("https://3f-six.vercel.app/auth/callback");
+    candidateUris.push(`${req.protocol}://${req.get("host")}/auth/callback`);
+
+    // Remove duplicates
+    const uniqueUris = Array.from(new Set(candidateUris.filter(Boolean)));
+
+    let lastError = "";
+    let tokenData: any = null;
+    let matchedUri = "";
+
+    for (const testUri of uniqueUris) {
+      try {
+        const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            code: cleanCode,
+            client_id: clientId,
+            client_secret: clientSecret,
+            redirect_uri: testUri,
+            grant_type: "authorization_code",
+          }),
+        });
+
+        const data = await tokenRes.json();
+        if (tokenRes.ok && data.access_token) {
+          tokenData = data;
+          matchedUri = testUri;
+          break;
+        } else {
+          lastError = data.error_description || data.error || "Código no válido para esta URI.";
+        }
+      } catch (err: any) {
+        lastError = err.message;
+      }
+    }
+
+    if (!tokenData) {
+      return res.status(400).json({
+        success: false,
+        error: `Error al intercambiar el código con Google OAuth: ${lastError}. Asegúrate de que el código no haya expirado y pertenezca al Client ID configurado.`,
+      });
+    }
+
+    // Fetch user profile
+    let userInfo: any = null;
+    try {
+      const userRes = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+        headers: { Authorization: `Bearer ${tokenData.access_token}` },
+      });
+      if (userRes.ok) {
+        userInfo = await userRes.json();
+      }
+    } catch (e) {
+      console.warn("Could not fetch user profile info:", e);
+    }
+
+    const sessionId = "gads_" + Math.random().toString(36).substring(2) + Date.now().toString(36);
+    gadsSessions.set(sessionId, {
+      sessionId,
+      accessToken: tokenData.access_token,
+      refreshToken: tokenData.refresh_token,
+      expiresAt: Date.now() + (tokenData.expires_in || 3600) * 1000,
+      userInfo: userInfo
+        ? { email: userInfo.email, name: userInfo.name, picture: userInfo.picture }
+        : undefined,
+    });
+
+    res.cookie("gads_session", sessionId, {
+      secure: true,
+      sameSite: "none",
+      httpOnly: true,
+      maxAge: 30 * 24 * 3600 * 1000,
+    });
+
+    return res.json({
+      success: true,
+      sessionId,
+      user: userInfo || { email: "Google Account Conectada" },
+      matchedUri,
+      message: "¡Cuenta de Google conectada con éxito!",
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Endpoint: Direct Refresh Token or Access Token linking
+app.post("/api/google-oauth/set-token", async (req, res) => {
+  try {
+    const { refreshToken, accessToken } = req.body;
+    if (!refreshToken && !accessToken) {
+      return res.status(400).json({
+        success: false,
+        error: "Debes ingresar al menos un Refresh Token o un Access Token válido de Google.",
+      });
+    }
+
+    const clientId = process.env.GOOGLE_ADS_CLIENT_ID;
+    const clientSecret = process.env.GOOGLE_ADS_CLIENT_SECRET;
+
+    let finalAccessToken = (accessToken || "").trim();
+    let finalRefreshToken = (refreshToken || "").trim();
+    let expiresAt = Date.now() + 3600 * 1000;
+
+    if (finalRefreshToken && clientId && clientSecret) {
+      const refreshRes = await fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          refresh_token: finalRefreshToken,
+          client_id: clientId,
+          client_secret: clientSecret,
+          grant_type: "refresh_token",
+        }),
+      });
+
+      const data = await refreshRes.json();
+      if (!refreshRes.ok) {
+        return res.status(400).json({
+          success: false,
+          error: `Error al validar el Refresh Token: ${data.error_description || data.error || "Token inválido"}.`,
+        });
+      }
+      finalAccessToken = data.access_token;
+      expiresAt = Date.now() + (data.expires_in || 3600) * 1000;
+    }
+
+    let userInfo: any = null;
+    try {
+      const userRes = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+        headers: { Authorization: `Bearer ${finalAccessToken}` },
+      });
+      if (userRes.ok) {
+        userInfo = await userRes.json();
+      }
+    } catch {}
+
+    const sessionId = "gads_" + Math.random().toString(36).substring(2) + Date.now().toString(36);
+    gadsSessions.set(sessionId, {
+      sessionId,
+      accessToken: finalAccessToken,
+      refreshToken: finalRefreshToken || undefined,
+      expiresAt,
+      userInfo: userInfo
+        ? { email: userInfo.email, name: userInfo.name, picture: userInfo.picture }
+        : undefined,
+    });
+
+    res.cookie("gads_session", sessionId, {
+      secure: true,
+      sameSite: "none",
+      httpOnly: true,
+      maxAge: 30 * 24 * 3600 * 1000,
+    });
+
+    return res.json({
+      success: true,
+      sessionId,
+      user: userInfo || { email: "Google Account Conectada" },
+      message: "¡Token vinculado exitosamente!",
+    });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err.message });
   }

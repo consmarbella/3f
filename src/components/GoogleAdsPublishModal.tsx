@@ -12,6 +12,12 @@ import {
   ArrowRight,
   Send,
   HelpCircle,
+  Copy,
+  Check,
+  Info,
+  Link2,
+  ChevronDown,
+  ChevronUp,
 } from "lucide-react";
 
 interface GoogleAdsAccount {
@@ -54,6 +60,19 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
   const [userProfile, setUserProfile] = useState<{ email?: string; name?: string; picture?: string } | null>(null);
   const [isCheckingAuth, setIsCheckingAuth] = useState<boolean>(true);
   const [authError, setAuthError] = useState<string | null>(null);
+
+  // Redirect URI selection & 404 Rescue states
+  const [redirectOption, setRedirectOption] = useState<"app" | "vercel" | "custom">("app");
+  const [customRedirectUri, setCustomRedirectUri] = useState<string>("");
+  const [copiedUriToast, setCopiedUriToast] = useState<boolean>(false);
+  const [manualExchangeInput, setManualExchangeInput] = useState<string>("");
+  const [isExchangingCode, setIsExchangingCode] = useState<boolean>(false);
+  const [manualExchangeError, setManualExchangeError] = useState<string | null>(null);
+  const [manualExchangeSuccess, setManualExchangeSuccess] = useState<string | null>(null);
+  const [showManualRescue, setShowManualRescue] = useState<boolean>(true);
+  const [showDirectToken, setShowDirectToken] = useState<boolean>(false);
+  const [directRefreshToken, setDirectRefreshToken] = useState<string>("");
+  const [isSavingDirectToken, setIsSavingDirectToken] = useState<boolean>(false);
 
   // Accounts state
   const [accounts, setAccounts] = useState<GoogleAdsAccount[]>([]);
@@ -227,10 +246,30 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
     }
   };
 
+  const getTargetRedirectUri = (): string => {
+    if (redirectOption === "vercel") {
+      return "https://3f-six.vercel.app/auth/callback";
+    }
+    if (redirectOption === "custom" && customRedirectUri.trim()) {
+      return customRedirectUri.trim();
+    }
+    return `${window.location.origin}/auth/callback`;
+  };
+
+  const copyToClipboard = (text: string) => {
+    try {
+      navigator.clipboard.writeText(text);
+      setCopiedUriToast(true);
+      setTimeout(() => setCopiedUriToast(false), 2500);
+    } catch {}
+  };
+
   const handleConnectGoogle = async () => {
     setAuthError(null);
+    setManualExchangeError(null);
     try {
-      const res = await fetch("/api/google-oauth/start?json=true");
+      const targetUri = getTargetRedirectUri();
+      const res = await fetch(`/api/google-oauth/start?json=true&redirect_uri=${encodeURIComponent(targetUri)}`);
       if (!res.ok) {
         const errData = await res.json();
         throw new Error(errData.error || "No se pudo iniciar el flujo de autenticación OAuth.");
@@ -261,6 +300,85 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
       }, 1500);
     } catch (err: any) {
       setAuthError(err.message || "Error al iniciar conexión con Google.");
+    }
+  };
+
+  const handleExchangeCode = async () => {
+    if (!manualExchangeInput.trim()) return;
+    setIsExchangingCode(true);
+    setManualExchangeError(null);
+    setManualExchangeSuccess(null);
+    try {
+      const targetUri = getTargetRedirectUri();
+      const res = await fetch("/api/google-oauth/exchange-code", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          rawUrl: manualExchangeInput.trim(),
+          code: manualExchangeInput.trim(),
+          redirectUri: targetUri,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || "No se pudo vincular el código de Google.");
+      }
+      if (data.sessionId) {
+        try {
+          localStorage.setItem("gads_session_id", data.sessionId);
+        } catch {}
+      }
+      setIsAuthenticated(true);
+      if (data.user) {
+        setUserProfile(data.user);
+        try {
+          localStorage.setItem("gads_user_info", JSON.stringify(data.user));
+        } catch {}
+      }
+      setManualExchangeSuccess("¡Cuenta de Google vinculada exitosamente!");
+      setAuthError(null);
+      fetchAccounts();
+    } catch (err: any) {
+      setManualExchangeError(err.message || "Error al procesar el código de autorización.");
+    } finally {
+      setIsExchangingCode(false);
+    }
+  };
+
+  const handleSaveDirectToken = async () => {
+    if (!directRefreshToken.trim()) return;
+    setIsSavingDirectToken(true);
+    setManualExchangeError(null);
+    try {
+      const res = await fetch("/api/google-oauth/set-token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          refreshToken: directRefreshToken.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || "No se pudo vincular el Refresh Token.");
+      }
+      if (data.sessionId) {
+        try {
+          localStorage.setItem("gads_session_id", data.sessionId);
+        } catch {}
+      }
+      setIsAuthenticated(true);
+      if (data.user) {
+        setUserProfile(data.user);
+        try {
+          localStorage.setItem("gads_user_info", JSON.stringify(data.user));
+        } catch {}
+      }
+      setAuthError(null);
+      fetchAccounts();
+    } catch (err: any) {
+      setManualExchangeError(err.message || "Error al validar el Refresh Token.");
+    } finally {
+      setIsSavingDirectToken(false);
     }
   };
 
@@ -479,10 +597,90 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
                     Verificando sesión activa con Google...
                   </div>
                 ) : !isAuthenticated ? (
-                  <div className="space-y-3">
-                    <p className="text-xs text-slate-400 leading-relaxed">
+                  <div className="space-y-4">
+                    <p className="text-xs text-slate-300 leading-relaxed">
                       Conecta tu cuenta de Google Cloud / Google Ads para autenticarte y autorizar la mutación de campañas en estado <strong className="text-emerald-400">PAUSED</strong>.
                     </p>
+
+                    {/* Selector de URI de Redirección Autorizada */}
+                    <div className="p-3.5 bg-slate-900/90 rounded-xl border border-slate-800 space-y-2.5">
+                      <div className="flex items-center justify-between">
+                        <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                          <Link2 className="w-3.5 h-3.5 text-indigo-400" />
+                          <span>URI de Redireccionamiento OAuth</span>
+                        </label>
+                        <span className="text-[10px] text-slate-400 font-mono">
+                          Google Cloud Console
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                        <button
+                          type="button"
+                          onClick={() => setRedirectOption("app")}
+                          className={`p-2.5 rounded-lg border text-left transition-all cursor-pointer ${
+                            redirectOption === "app"
+                              ? "bg-indigo-950/40 border-indigo-500/50 text-white"
+                              : "bg-slate-950/40 border-slate-800 text-slate-400 hover:text-slate-300"
+                          }`}
+                        >
+                          <div className="font-semibold text-xs flex items-center justify-between">
+                            <span>App Actual (Recomendado)</span>
+                            {redirectOption === "app" && <Check className="w-3.5 h-3.5 text-indigo-400" />}
+                          </div>
+                          <div className="text-[11px] text-slate-400 truncate mt-0.5 font-mono">
+                            {window.location.origin}/auth/callback
+                          </div>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => setRedirectOption("vercel")}
+                          className={`p-2.5 rounded-lg border text-left transition-all cursor-pointer ${
+                            redirectOption === "vercel"
+                              ? "bg-indigo-950/40 border-indigo-500/50 text-white"
+                              : "bg-slate-950/40 border-slate-800 text-slate-400 hover:text-slate-300"
+                          }`}
+                        >
+                          <div className="font-semibold text-xs flex items-center justify-between">
+                            <span>Dominio Vercel</span>
+                            {redirectOption === "vercel" && <Check className="w-3.5 h-3.5 text-indigo-400" />}
+                          </div>
+                          <div className="text-[11px] text-slate-400 truncate mt-0.5 font-mono">
+                            https://3f-six.vercel.app/auth/callback
+                          </div>
+                        </button>
+                      </div>
+
+                      {/* Display of Active Target URI and Copy Button */}
+                      <div className="flex items-center gap-2 pt-1">
+                        <div className="flex-1 px-3 py-1.5 bg-slate-950 rounded-lg border border-slate-800 text-[11px] font-mono text-emerald-400 truncate">
+                          {getTargetRedirectUri()}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => copyToClipboard(getTargetRedirectUri())}
+                          className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-white text-xs font-medium rounded-lg flex items-center gap-1.5 transition-all cursor-pointer shrink-0"
+                          title="Copiar URI para Google Cloud Console"
+                        >
+                          {copiedUriToast ? (
+                            <>
+                              <Check className="w-3.5 h-3.5 text-emerald-400" />
+                              <span className="text-emerald-400">¡Copiado!</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3.5 h-3.5 text-slate-300" />
+                              <span>Copiar URI</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+
+                      <p className="text-[11px] text-slate-400 leading-normal">
+                        Para evitar el error <code className="text-amber-400">redirect_uri_mismatch</code>, copia esta URI exacta y agrégala en <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer" className="text-indigo-400 underline hover:text-indigo-300">Google Cloud Console &gt; Credenciales &gt; Tu Cliente Web</a> en <em>"URIs de redireccionamiento autorizados"</em>.
+                      </p>
+                    </div>
 
                     {authError && (
                       <div className="p-3 bg-red-950/50 border border-red-500/40 rounded-lg text-xs text-red-300 flex items-start gap-2">
@@ -491,30 +689,133 @@ export const GoogleAdsPublishModal: React.FC<GoogleAdsPublishModalProps> = ({
                       </div>
                     )}
 
-                    <button
-                      onClick={handleConnectGoogle}
-                      className="w-full sm:w-auto px-5 py-2.5 bg-white hover:bg-slate-100 text-slate-900 font-bold rounded-xl shadow-lg transition-all flex items-center justify-center gap-3 cursor-pointer text-xs sm:text-sm active:scale-95"
-                    >
-                      <svg className="w-4 h-4" viewBox="0 0 24 24">
-                        <path
-                          fill="#4285F4"
-                          d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
-                        />
-                        <path
-                          fill="#34A853"
-                          d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
-                        />
-                        <path
-                          fill="#FBBC05"
-                          d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"
-                        />
-                        <path
-                          fill="#EA4335"
-                          d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"
-                        />
-                      </svg>
-                      <span>Conectar con Google</span>
-                    </button>
+                    {/* Primary Connect Button */}
+                    <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+                      <button
+                        onClick={handleConnectGoogle}
+                        className="px-5 py-2.5 bg-white hover:bg-slate-100 text-slate-900 font-bold rounded-xl shadow-lg transition-all flex items-center justify-center gap-3 cursor-pointer text-xs sm:text-sm active:scale-95"
+                      >
+                        <svg className="w-4 h-4" viewBox="0 0 24 24">
+                          <path
+                            fill="#4285F4"
+                            d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
+                          />
+                          <path
+                            fill="#34A853"
+                            d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
+                          />
+                          <path
+                            fill="#FBBC05"
+                            d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"
+                          />
+                          <path
+                            fill="#EA4335"
+                            d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"
+                          />
+                        </svg>
+                        <span>Conectar con Google</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setShowManualRescue(!showManualRescue)}
+                        className="px-3 py-2 text-xs text-indigo-400 hover:text-indigo-300 flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                      >
+                        <span>{showManualRescue ? "Ocultar Rescate 404 / Manual" : "¿Problemas con el popup o 404? Haz clic aquí"}</span>
+                        {showManualRescue ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                      </button>
+                    </div>
+
+                    {/* CAJA DE RESCATE: ERROR 404 EN VERCEL / VINCULACIÓN MANUAL */}
+                    {showManualRescue && (
+                      <div className="p-4 bg-amber-950/20 border border-amber-500/40 rounded-xl space-y-3">
+                        <div className="flex items-start gap-2.5">
+                          <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                          <div className="space-y-1">
+                            <h5 className="text-xs font-bold text-amber-200">
+                              Rescate de Autenticación: ¿Viste error 404 en Vercel o la ventana no cerró sola?
+                            </h5>
+                            <p className="text-[11px] text-slate-300 leading-relaxed">
+                              Si Google te permitió iniciar sesión pero te redirigió a una página que dice <code className="text-amber-300">404: NOT_FOUND</code> o similar, ¡tu autorización fue generada con éxito! Simplemente copia la <strong>URL completa de la barra de direcciones</strong> de esa ventana (o el parámetro <code className="text-emerald-400">code=4/...</code>) y pégala aquí:
+                            </p>
+                          </div>
+                        </div>
+
+                        {manualExchangeError && (
+                          <div className="p-2.5 bg-red-950/60 border border-red-500/40 rounded-lg text-xs text-red-300 flex items-start gap-2">
+                            <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0 mt-0.5" />
+                            <div>{manualExchangeError}</div>
+                          </div>
+                        )}
+
+                        {manualExchangeSuccess && (
+                          <div className="p-2.5 bg-emerald-950/60 border border-emerald-500/40 rounded-lg text-xs text-emerald-300 flex items-center gap-2">
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                            <div>{manualExchangeSuccess}</div>
+                          </div>
+                        )}
+
+                        <div className="flex flex-col sm:flex-row gap-2">
+                          <input
+                            type="text"
+                            placeholder="Pega la URL de la ventana 404 (https://.../auth/callback?code=...) o el código directo"
+                            value={manualExchangeInput}
+                            onChange={(e) => setManualExchangeInput(e.target.value)}
+                            className="flex-1 px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs font-mono text-white placeholder-slate-500 focus:outline-none focus:border-amber-400"
+                          />
+                          <button
+                            type="button"
+                            onClick={handleExchangeCode}
+                            disabled={isExchangingCode || !manualExchangeInput.trim()}
+                            className="px-4 py-2 bg-amber-500 hover:bg-amber-400 disabled:bg-slate-800 disabled:text-slate-600 text-slate-950 font-bold rounded-lg text-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
+                          >
+                            {isExchangingCode ? (
+                              <>
+                                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                <span>Vinculando...</span>
+                              </>
+                            ) : (
+                              <>
+                                <CheckCircle2 className="w-3.5 h-3.5" />
+                                <span>Completar Conexión</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+
+                        {/* Direct Refresh Token toggle */}
+                        <div className="pt-1 border-t border-slate-800/80">
+                          <button
+                            type="button"
+                            onClick={() => setShowDirectToken(!showDirectToken)}
+                            className="text-[11px] text-slate-400 hover:text-slate-200 underline cursor-pointer"
+                          >
+                            {showDirectToken ? "Ocultar opción de Refresh Token directo" : "O ingresar un Refresh Token de Google directamente"}
+                          </button>
+
+                          {showDirectToken && (
+                            <div className="mt-2.5 space-y-2">
+                              <input
+                                type="text"
+                                placeholder="Pega tu Refresh Token de Google OAuth (1//0...)"
+                                value={directRefreshToken}
+                                onChange={(e) => setDirectRefreshToken(e.target.value)}
+                                className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs font-mono text-white placeholder-slate-500 focus:outline-none focus:border-indigo-400"
+                              />
+                              <button
+                                type="button"
+                                onClick={handleSaveDirectToken}
+                                disabled={isSavingDirectToken || !directRefreshToken.trim()}
+                                className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-600 text-white font-medium rounded-lg text-xs transition-all flex items-center gap-1.5 cursor-pointer"
+                              >
+                                {isSavingDirectToken ? <RefreshCw className="w-3 h-3 animate-spin mr-1" /> : null}
+                                <span>Guardar Refresh Token</span>
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 ) : (
                   <div className="flex items-center justify-between p-3.5 bg-slate-900 rounded-xl border border-slate-800">
