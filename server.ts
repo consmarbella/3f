@@ -5,8 +5,18 @@ import "dotenv/config";
 import cookieParser from "cookie-parser";
 import { GoogleGenAI, Type } from "@google/genai";
 import { generateDeterministicCertifiedCampaign } from "./src/utils/certifiedCampaignEngine.js";
-import { matchRetryFix } from "./src/utils/googleAdsCompat.js";
-import { adaptCampaignForManualSearch } from "./src/utils/googleAdsManualSearchAdapter.js";
+import {
+  DEFAULT_SPEC_CONFIG,
+  runPreflight,
+  toBulkMutateRequest,
+} from "./src/utils/google-ads-search-manual-cpc-spec-v3.js";
+import type {
+  MutationRequest,
+  ValidationIssue,
+  OmittedItem,
+} from "./src/utils/google-ads-search-manual-cpc-spec-v3.js";
+import { toGenerationSpec } from "./src/utils/generationSpecBridge.js";
+import { resolveBillableUnitMicros } from "./src/utils/googleAdsManualSearchAdapter.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -477,6 +487,10 @@ Devuelve la respuesta strictly en formato JSON según el esquema especificado.
       });
       engineSource = "certified_deterministic_engine";
     }
+
+    // El schema del LLM no incluye website y el publish lo exige para finalUrls:
+    // se estampa del brief (vía Gemini o engine, mismo valor).
+    if (!campaignData.website && website) campaignData.website = website;
 
     // Sanitization & double safety for character limits
     if (campaignData.sitelinks && Array.isArray(campaignData.sitelinks)) {
@@ -1381,7 +1395,7 @@ app.get("/api/google-ads/accounts", async (req, res) => {
 // Funciones puras a nivel de módulo para poder probar el mapeo con conteos
 // reales sin llamar a Google.
 export type PublishStage = {
-  stage: "budget" | "campaign" | "adGroups" | "criteria" | "ads" | "assets";
+  stage: "budget" | "campaign" | "campaignCriteria" | "adGroups" | "criteria" | "ads" | "assets" | "unknown";
   attempted: boolean;
   ok: boolean;
   created: number;
@@ -1389,6 +1403,59 @@ export type PublishStage = {
   requestId?: string | null;
   error?: string;
 };
+
+// Servicio del plan (spec v3) -> etapa lógica del reporte.
+const BULK_SERVICE_TO_STAGE: Record<string, PublishStage["stage"]> = {
+  CampaignBudgetService: "budget",
+  CampaignService: "campaign",
+  CampaignCriterionService: "campaignCriteria",
+  AdGroupService: "adGroups",
+  AdGroupCriterionService: "criteria",
+  AdGroupAdService: "ads",
+  AssetService: "assets",
+  CampaignAssetService: "assets",
+};
+
+// Familia de errorCode -> etapa lógica. Sin match confiable: "unknown" (nunca se inventa).
+const ERROR_FAMILY_TO_STAGE: Array<{ match: RegExp; stage: PublishStage["stage"] }> = [
+  { match: /CAMPAIGNBUDGET|_BUDGET/i, stage: "budget" },
+  { match: /CAMPAIGN_CRITERION|CAMPAIGNCRITERION/i, stage: "campaignCriteria" },
+  { match: /CAMPAIGN(?!_CRITERION|CRITERION)/i, stage: "campaign" },
+  { match: /ADGROUPCRITERION|AD_GROUP_CRITERION/i, stage: "criteria" },
+  { match: /ADGROUPAD|AD_GROUP_AD/i, stage: "ads" },
+  { match: /KEYWORD|CRITERION/i, stage: "criteria" },
+  { match: /ADGROUP(?!AD|CRITERION)/i, stage: "adGroups" },
+  { match: /\bAD[A-Z_]/i, stage: "ads" },
+  { match: /ASSET/i, stage: "assets" },
+];
+
+function collectErrorCodes(data: any): string[] {
+  const codes: string[] = [];
+  try {
+    const details = data?.error?.details || [];
+    const walk = (o: any) => {
+      if (!o || typeof o !== "object") return;
+      for (const [k, v] of Object.entries(o)) {
+        // Claves (ej: campaignError, adGroupAdError) y valores
+        // (ej: CUSTOMER_NOT_ENABLED): la familia puede venir en cualquiera.
+        if (typeof v === "string" && /error/i.test(k)) {
+          codes.push(k);
+          codes.push(v);
+        } else if (typeof v === "object") walk(v);
+      }
+    };
+    details.forEach(walk);
+  } catch {}
+  return codes;
+}
+
+function attributeStage(codes: string[]): PublishStage["stage"] | "unknown" {
+  const joined = codes.join(" ");
+  for (const { match, stage } of ERROR_FAMILY_TO_STAGE) {
+    if (match.test(joined)) return stage;
+  }
+  return "unknown";
+}
 
 export function gadsErrorMsg(data: any, fallback: string): string {
   try {
@@ -1494,273 +1561,224 @@ app.post("/api/google-ads/publish", async (req, res) => {
       headers["login-customer-id"] = process.env.GOOGLE_ADS_LOGIN_CUSTOMER_ID.replace(/[^0-9]/g, "");
     }
 
-    // 0. GoogleAdsManualSearchAdapter: spec fija Manual Search derivada de la
-    // documentación oficial (contrato permanente). Traduce campaignData
-    // completo a operaciones válidas + correcciones/omisiones.
-    const plan = adaptCampaignForManualSearch(campaignData);
-    campaignData = plan.normalized;
-    const correctionsApplied = plan.correctionsApplied;
-    const omittedItems = plan.omittedItems;
-    const cleanCampaignName = plan.campaignName;
-    const website = plan.website;
-    const adGroupsToCreate = plan.adGroupsToCreate;
-
-    // Definida como function (hoisted) y ANTES del primer uso: runStage la
-    // invoca en la etapa budget; como const quedaba en TDZ hasta la línea 1741.
-    async function gadsMutate(service: string, operations: any[]) {
-      const r = await fetch(
-        `https://googleads.googleapis.com/${GOOGLE_ADS_API_VERSION}/customers/${cleanCustomerId}/${service}:mutate`,
-        { method: "POST", headers, body: JSON.stringify({ operations }) }
-      );
-      return safeGoogleAdsJson(r);
-    }
-
-    // Safe retry por etapa: ante error conocido, corrige y reintenta UNA vez
-    const runStage = async (stageName: string, service: string, operations: any[]) => {
-      let r = await gadsMutate(service, operations);
-      if (!r.ok) {
-        const fixNote = matchRetryFix(service, operations, r.data);
-        if (fixNote) {
-          correctionsApplied.push({
-            area: stageName,
-            field: service,
-            before: "rechazado por Google",
-            after: fixNote,
-            reason: "Error conocido: corrección automática + reintento",
-          });
-          r = await gadsMutate(service, operations);
-        }
-      }
-      return r;
-    };
-
-    // 1. CampaignBudget válido según spec (monto normalizado >= 1 unidad)
-    const { ok: budgetOk, status: budgetStatus, data: budgetData } = await runStage(
-      "budget",
-      "campaignBudgets",
-      plan.budgetOperations
-    );
-    if (!budgetOk) {
-      const errMsg =
-        budgetData.error?.details?.[0]?.errors?.[0]?.message ||
-        budgetData.error?.message ||
-        "Error al crear el presupuesto de campaña en Google Ads.";
-      return res.status(budgetStatus).json({
-        success: false,
-        partialSuccess: false,
-        failedStage: "budget",
-        requestId: gadsRequestId(budgetData),
-        error: `Error en Google Ads API (Budget): ${errMsg}`,
-        googleDetails: budgetData.error,
-        correctionsApplied,
-        omittedItems,
-        stages: [],
-      });
-    }
-
-    const budgetResourceName = budgetData.results?.[0]?.resourceName;
-
-    // 2. Campaign SEARCH + PAUSED + Manual CPC según spec (nunca Smart Bidding)
-    const campaignOperation = plan.buildCampaignOperation(budgetResourceName);
-    console.log("[Google Ads] bidding strategy:", JSON.stringify(campaignOperation.create.manualCpc));
-    const { ok: campaignOk, status: campaignStatus, data: campaignRespData } = await runStage(
-      "campaign",
-      "campaigns",
-      [campaignOperation]
-    );
-    if (!campaignOk) {
-      const errMsg =
-        campaignRespData.error?.details?.[0]?.errors?.[0]?.message ||
-        campaignRespData.error?.message ||
-        "Error al crear la campaña en Google Ads.";
-      return res.status(campaignStatus).json({
-        success: false,
-        partialSuccess: true,
-        failedStage: "campaign",
-        requestId: gadsRequestId(campaignRespData),
-        error: `Error en Google Ads API (Campaign): ${errMsg}`,
-        googleDetails: campaignRespData.error,
-        budgetResourceName,
-        correctionsApplied,
-        omittedItems,
-        stages: [{ stage: "budget", attempted: true, ok: true, created: 1, failed: 0 }],
-      });
-    }
-
-    const campaignResourceName = campaignRespData.results?.[0]?.resourceName;
-    const campaignId = campaignResourceName?.split("/").pop();
-
-    // --- Traductor campaignData -> Google Ads API: reporte por etapa ---
-    // success:true solo si TODA la estructura principal subió (req. 5).
-    const stages: PublishStage[] = [
-      { stage: "budget", attempted: true, ok: true, created: 1, failed: 0 },
-      { stage: "campaign", attempted: true, ok: true, created: 1, failed: 0 },
-    ];
-    const failPublish = (
-      stage: PublishStage["stage"],
-      attempted: number,
-      httpStatus: number,
-      label: string,
-      data: any,
-      fallback: string
-    ) => {
-      const errMsg = gadsErrorMsg(data, fallback);
-      const requestId = gadsRequestId(data);
-      stages.push({ stage, attempted: attempted > 0, ok: false, created: 0, failed: attempted, requestId, error: `${label}: ${errMsg}` });
-      const partialSuccess = stages.some((s) => s.ok && s.created > 0);
-      return res.status(httpStatus).json({
-        success: false,
-        partialSuccess,
-        failedStage: stage,
-        requestId,
-        error: `Error en Google Ads API (${label}): ${errMsg}`,
-        googleDetails: data?.error || null,
-        customerId: cleanCustomerId,
-        campaignName: cleanCampaignName,
-        campaignResourceName,
-        campaignId,
-        budgetResourceName,
-        correctionsApplied,
-        omittedItems,
-        stages,
-      });
-    };
-
-    // 3. AdGroups válidos según spec. La moneda se obtiene por GAQL y cada
-    // cpc se normaliza a la billable unit (nunca se envía el default directo).
+    // 0. Spec v3 como única fuente: currency real -> cfg -> bridge -> preflight.
+    // Nada se muta antes de que runPreflight declare publishable.
     const currencyLookup = await fetchAccountCurrencyCode(cleanCustomerId, headers);
     const currencyCode = currencyLookup.currencyCode;
+    const unitMicros = resolveBillableUnitMicros(currencyCode);
+    const preflightNotes: Array<{ area: string; field: string; before: string; after: string; reason: string }> = [];
     if (currencyLookup.viaFallback) {
-      correctionsApplied.push({
-        area: "adGroups",
+      preflightNotes.push({
+        area: "account",
         field: "currencyCode",
         before: "GAQL fallido",
         after: "USD (fallback)",
         reason: "No se pudo leer la moneda: default registrado, no ciego",
       });
     }
-    const { operations: adGroupOperations, bidDetails } = plan.buildAdGroupOperations(
-      campaignResourceName,
-      currencyCode
-    );
-    bidDetails.forEach((d) => {
-      console.log("[Google Ads] cpc bid:", JSON.stringify(d));
-      if (d.normalizedBidMicros !== d.requestedBidMicros) {
-        correctionsApplied.push({
-          area: "adGroups",
-          field: `cpcBidMicros:${d.adGroup}`,
-          before: String(d.requestedBidMicros),
-          after: String(d.normalizedBidMicros),
-          reason: `Billable unit ${currencyCode} (${d.billableUnitMicros} micros)${d.appliedMinimum ? " + mínimo aplicado" : ""}`,
-        });
-      }
+    const specCfg = {
+      ...DEFAULT_SPEC_CONFIG,
+      money: { billableUnitMicros: unitMicros, defaultAdGroupBidMicros: unitMicros },
+    };
+    const genSpec = toGenerationSpec(campaignData, {
+      customerId: cleanCustomerId,
+      currencyCode,
+      website: campaignData?.website,
     });
+    const pre = runPreflight(genSpec, specCfg);
 
-    const { ok: agOk, status: agStatus, data: agData } = await runStage("adGroups", "adGroups", adGroupOperations);
-    if (!agOk) {
-      return failPublish("adGroups", adGroupOperations.length, agStatus, "AdGroups", agData, "Error al crear los grupos de anuncios en Google Ads.");
-    }
-    const adGroupResourceNames: string[] = (agData.results || []).map((r: any) => r.resourceName);
-    stages.push({ stage: "adGroups", attempted: true, ok: true, created: adGroupResourceNames.length, failed: 0 });
+    const toCompatCorrection = (i: ValidationIssue) => ({
+      area: i.field,
+      field: i.rule,
+      before: i.before ?? "",
+      after: i.after ?? "",
+      reason: `${i.errorCode} [${i.tier}/${i.errorClass}]`,
+    });
+    const toCompatOmission = (o: OmittedItem) => ({
+      area: o.kind,
+      item: o.ref,
+      reason: `${o.reason} (${o.errorCode})`,
+    });
+    const correctionsApplied = [...preflightNotes, ...pre.correctionsApplied.map(toCompatCorrection)];
+    const omittedItems = pre.omittedItems.map(toCompatOmission);
 
-    // 4. AdGroupCriteria válidos para keywords (spec: EXACT/PHRASE/BROAD)
-    const { operations: criteriaOperations, sourceCount: sourceCriteriaCount } =
-      plan.buildCriteriaOperationsFor(adGroupResourceNames);
-    if (criteriaOperations.length === 0) {
-      if (sourceCriteriaCount > 0) {
-        return failPublish("criteria", sourceCriteriaCount, 502, "Criteria", null, "Ninguna keyword/negativa de la plataforma pudo mapearse a Google Ads.");
-      }
-      stages.push({ stage: "criteria", attempted: false, ok: true, created: 0, failed: 0 });
-    } else {
-      const { ok: crOk, status: crStatus, data: crData } = await runStage("criteria", "adGroupCriteria", criteriaOperations);
-      if (!crOk) {
-        return failPublish("criteria", criteriaOperations.length, crStatus, "Criteria", crData, "Error al crear keywords/negativas en Google Ads.");
-      }
-      stages.push({ stage: "criteria", attempted: true, ok: true, created: (crData.results || []).length, failed: 0 });
-    }
-
-    // 5. AdGroupAds válidos tipo RSA (spec: 3+ headlines, 2+ descripciones, final URL)
-    const adOperations: any[] = plan.buildAdOperationsFor(adGroupResourceNames);
-    if (adOperations.length === 0) {
-      return failPublish("ads", adGroupResourceNames.length, 502, "Ads", null, "Ningún RSA de la plataforma cumplió los mínimos de Google (3 titulares + 2 descripciones).");
-    }
-    const { ok: adOk, status: adStatus, data: adData } = await runStage("ads", "adGroupAds", adOperations);
-    if (!adOk) {
-      return failPublish("ads", adOperations.length, adStatus, "Ads", adData, "Error al crear los anuncios RSA en Google Ads.");
-    }
-    stages.push({ stage: "ads", attempted: true, ok: true, created: (adData.results || []).length, failed: 0 });
-
-    // 6. Assets: sitelinks + callouts de la plataforma -> assets + campaignAsset
-    const assetCreates = plan.assetCreates;
-    if (assetCreates.length === 0) {
-      stages.push({ stage: "assets", attempted: false, ok: true, created: 0, failed: 0 });
-    } else {
-      const { ok: asOk, status: asStatus, data: asData } = await runStage(
-        "assets",
-        "assets",
-        assetCreates.map((a) => a.create)
-      );
-      if (!asOk) {
-        return failPublish("assets", assetCreates.length, asStatus, "Assets", asData, "Error al crear assets (sitelinks/callouts) en Google Ads.");
-      }
-      const assetResources: string[] = (asData.results || []).map((r: any) => r.resourceName);
-      const linkOps = assetResources.map((ar: string, i: number) => ({
-        create: {
-          campaign: campaignResourceName,
-          asset: ar,
-          fieldType: assetCreates[i].kind,
-          status: "PAUSED",
-        },
-      }));
-      const { ok: caOk, status: caStatus, data: caData } = await runStage("assets", "campaignAsset", linkOps);
-      if (!caOk) {
-        return failPublish("assets", linkOps.length, caStatus, "CampaignAssets", caData, "Error al vincular assets (sitelinks/callouts) a la campaña.");
-      }
-      stages.push({ stage: "assets", attempted: true, ok: true, created: assetResources.length, failed: 0 });
-    }
-
-    // Éxito solo si TODA la estructura principal subió (req. 5): sin éxito falso.
-    const mainStages: Array<PublishStage["stage"]> = ["budget", "campaign", "adGroups", "criteria", "ads"];
-    const mainOk = mainStages.every(
-      (m) => stages.find((s) => s.stage === m)?.attempted && stages.find((s) => s.stage === m)?.ok
-    );
-    const allOk = stages.filter((s) => s.attempted).every((s) => s.ok);
-    if (!mainOk || !allOk) {
-      const failed = stages.filter((s) => s.attempted && !s.ok);
-      return res.status(502).json({
+    if (!pre.publishable || !pre.plan) {
+      return res.status(422).json({
         success: false,
-        partialSuccess: true,
-        failedStage: failed[0]?.stage || null,
-        requestId: failed[0]?.requestId || null,
-        error: `Publicación parcial en Google Ads: ${failed.map((s) => s.error || s.stage).join(" | ")}`,
-        googleDetails: null,
+        partialSuccess: false,
+        publishable: false,
+        blockingIssues: pre.blockingIssues,
+        correctionsApplied,
+        omittedItems,
+        error: `Preflight bloqueó el publish: ${pre.blockingIssues.map((b) => `${b.field}: ${b.errorCode}`).join(" | ") || "estructura no publicable"}`,
         customerId: cleanCustomerId,
-        campaignName: cleanCampaignName,
-        campaignResourceName,
+        stages: [],
+      });
+    }
+
+    const bulk = toBulkMutateRequest(pre.plan);
+    // validateOnly: SOLO flag de prueba/debug (?validateOnly=true). Respuesta
+    // DEBUG separada; jamás mezclada con la forma normal de publish.
+    const isValidateOnly = req.query.validateOnly === "true";
+
+    // Ejecutor bulk: un solo POST googleAds:mutate, partialFailure:false.
+    async function postBulk(validateOnly: boolean) {
+      const body: Record<string, unknown> = {
+        mutateOperations: bulk.mutateOperations,
+        partialFailure: false,
+      };
+      if (validateOnly) body.validate_only = true;
+      const r = await fetch(`https://googleads.googleapis.com${bulk.restPath}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
+      return safeGoogleAdsJson(r);
+    }
+
+    const LOGICAL_ORDER: PublishStage["stage"][] = [
+      "budget",
+      "campaign",
+      "campaignCriteria",
+      "adGroups",
+      "criteria",
+      "ads",
+      "assets",
+    ];
+    const stageOfOp = (i: number): PublishStage["stage"] => BULK_SERVICE_TO_STAGE[bulk.opServices[i]];
+    const opCountOf = (st: PublishStage["stage"]) =>
+      bulk.opServices.filter((s) => BULK_SERVICE_TO_STAGE[s] === st).length;
+
+    // (Mutates secuenciales budget/campaign reemplazados por el bulk único más abajo)
+
+    // Ejecución bulk única (reemplaza etapas secuenciales 1-6)
+    const { ok: bulkOk, status: bulkStatus, data: bulkData } = await postBulk(isValidateOnly);
+    const bulkRequestId = gadsRequestId(bulkData);
+    console.log("[Google Ads] bulk mutate:", JSON.stringify({ ops: bulk.mutateOperations.length, ok: bulkOk, status: bulkStatus }));
+
+    // validateOnly: respuesta DEBUG separada. Nunca la forma normal de publish.
+    if (isValidateOnly) {
+      return res.json({
+        validateOnly: true,
+        publishable: true,
+        customerId: cleanCustomerId,
+        currencyCode,
+        operationsSent: bulk.mutateOperations.length,
+        opServices: bulk.opServices,
+        googleOk: bulkOk,
+        googleStatus: bulkStatus,
+        googleError: (bulkData as any)?.error || null,
+        requestId: bulkRequestId,
+        correctionsApplied,
+        omittedItems,
+      });
+    }
+
+    const responses: any[] =
+      (bulkData as any)?.mutateOperationResponses || (bulkData as any)?.results || [];
+
+    if (bulkOk) {
+      const createdByStage: Record<string, number> = {};
+      const resourcesByStage: Record<string, string[]> = {};
+      responses.forEach((r: any, i: number) => {
+        const st = stageOfOp(i);
+        createdByStage[st] = (createdByStage[st] || 0) + 1;
+        const rn =
+          r?.resourceName ||
+          Object.values(r || {}).find(
+            (v) => typeof v === "string" && String(v).startsWith("customers/")
+          );
+        if (rn) {
+          (resourcesByStage[st] = resourcesByStage[st] || []).push(String(rn));
+        }
+      });
+      const stages: PublishStage[] = LOGICAL_ORDER.map((st) => {
+        const attempted = opCountOf(st);
+        return { stage: st, attempted: attempted > 0, ok: true, created: createdByStage[st] || 0, failed: 0 };
+      });
+      const campaignRn = (resourcesByStage["campaign"] || [])[0] || "";
+      const campaignId = campaignRn.split("/").pop() || "";
+      const budgetRn = (resourcesByStage["budget"] || [])[0] || "";
+      const campaignName = pre.normalizedSpec.campaign.name;
+      return res.json({
+        success: true,
+        partialSuccess: false,
+        publishable: true,
+        blockingIssues: [],
+        failedStage: null,
+        requestId: null,
+        status: "PAUSED",
+        bidding: "MANUAL_CPC",
+        customerId: cleanCustomerId,
+        campaignName,
+        campaignResourceName: campaignRn,
         campaignId,
-        budgetResourceName,
+        budgetResourceName: budgetRn,
+        adGroupsCount: createdByStage["adGroups"] || 0,
+        message: `¡Campaña "${campaignName}" publicada con éxito en Google Ads en estado PAUSED!`,
+        googleAdsUrl: campaignId ? `https://ads.google.com/aw/campaigns?campaignId=${campaignId}` : null,
+        timestamp: new Date().toISOString(),
         correctionsApplied,
         omittedItems,
         stages,
       });
     }
 
-    return res.json({
-      success: true,
+    // partialFailure:false => rollback atómico: nada persistió.
+    const bulkErrors: any[] = (bulkData as any)?.error?.details?.[0]?.errors || [];
+    const grouped = new Map<string, string[]>();
+    for (const e of bulkErrors) {
+      const codes: string[] = [];
+      for (const [k, v] of Object.entries((e as any)?.errorCode || {})) {
+        codes.push(k);
+        if (typeof v === "string") codes.push(v);
+      }
+      const st = codes.length > 0 ? attributeStage(codes) : "unknown";
+      const arr = grouped.get(st) || [];
+      if ((e as any)?.message) arr.push(String((e as any).message));
+      grouped.set(st, arr);
+    }
+    if (grouped.size === 0) {
+      grouped.set("unknown", [(bulkData as any)?.error?.message || "Error desconocido de Google Ads"]);
+    }
+    const stages: PublishStage[] = LOGICAL_ORDER.filter((st) => opCountOf(st) > 0).map((st) => {
+      const msgs = grouped.get(st) || [];
+      return {
+        stage: st,
+        attempted: true,
+        ok: false,
+        created: 0,
+        failed: opCountOf(st),
+        requestId: bulkRequestId,
+        error: msgs.length > 0 ? msgs.join(" | ") : "No persistido (rollback atómico, partialFailure:false)",
+      };
+    });
+    if (grouped.has("unknown")) {
+      const msgs = grouped.get("unknown")!;
+      stages.push({
+        stage: "unknown",
+        attempted: true,
+        ok: false,
+        created: 0,
+        failed: msgs.length,
+        requestId: bulkRequestId,
+        error: msgs.join(" | "),
+      });
+    }
+    const failedStage = (LOGICAL_ORDER.find((st) => grouped.has(st)) || "unknown") as PublishStage["stage"];
+    const firstMsgs = grouped.get(failedStage) || [];
+    return res.status(bulkStatus).json({
+      success: false,
       partialSuccess: false,
-      failedStage: null,
-      requestId: null,
-      status: "PAUSED",
-      bidding: "MANUAL_CPC",
+      publishable: true,
+      blockingIssues: [],
+      failedStage,
+      requestId: bulkRequestId,
+      error: `Google Ads rechazó el bulk mutate: ${firstMsgs.join(" | ") || (bulkData as any)?.error?.message || "error desconocido"}`,
+      googleDetails: (bulkData as any)?.error || null,
       customerId: cleanCustomerId,
-      campaignName: cleanCampaignName,
-      campaignResourceName,
-      campaignId,
-      budgetResourceName,
-      adGroupsCount: adGroupResourceNames.length,
-      message: `¡Campaña "${cleanCampaignName}" publicada con éxito en Google Ads en estado PAUSED!`,
-      googleAdsUrl: `https://ads.google.com/aw/campaigns?campaignId=${campaignId}`,
-      timestamp: new Date().toISOString(),
+      operationsSent: bulk.mutateOperations.length,
+      opServices: bulk.opServices,
       correctionsApplied,
       omittedItems,
       stages,
