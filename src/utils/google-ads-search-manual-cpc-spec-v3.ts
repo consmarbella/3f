@@ -671,7 +671,7 @@ export function buildPublishPlan(spec: GoogleAdsGenerationSpec, loginCustomerId?
       tempIds[`asset:${a.type}`] = assetRn;
       const create: Record<string, unknown> = { resourceName: assetRn };
       switch (a.type) {
-        case 'SITELINK': create.sitelinkAsset = { linkText: a.linkText, finalUrls: [a.finalUrl],
+        case 'SITELINK': create.sitelinkAsset = { linkText: a.linkText,
           ...(a.descriptionLine1 ? { description1: a.descriptionLine1 } : {}),
           ...(a.descriptionLine2 ? { description2: a.descriptionLine2 } : {}) }; break;
         case 'CALLOUT': create.calloutAsset = { calloutText: a.text }; break;
@@ -680,7 +680,12 @@ export function buildPublishPlan(spec: GoogleAdsGenerationSpec, loginCustomerId?
         case 'PROMOTION': create.promotionAsset = { promotionText: a.promotionText }; break;
       }
       assetOps.push({ create });
-      linkOps.push({ create: { asset: assetRn, campaign: campaignRn, fieldType: fieldType[a.type] } });
+      // Sitelinks need finalUrls at CampaignAsset level, not SitelinkAsset level
+      const linkOp: Record<string, unknown> = { create: { asset: assetRn, campaign: campaignRn, fieldType: fieldType[a.type] } };
+      if (a.type === 'SITELINK') {
+        (linkOp.create as any).finalUrls = [a.finalUrl];
+      }
+      linkOps.push({ create: linkOp.create });
     }
     batches.push({ service: 'AssetService',
       restPath: `/v25/customers/${cid}/assets:mutate`, operations: assetOps });
