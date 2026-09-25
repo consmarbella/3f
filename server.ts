@@ -1583,7 +1583,8 @@ app.post("/api/google-ads/publish", async (req, res) => {
     const genSpec = toGenerationSpec(campaignData, {
       customerId: cleanCustomerId,
       currencyCode,
-      website: campaignData?.website,
+      // Fallback para campañas generadas antes del stamp de website en generate-campaign
+      website: (req.body as any)?.website || campaignData?.website,
     });
     const pre = runPreflight(genSpec, specCfg);
 
