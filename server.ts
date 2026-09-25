@@ -1580,11 +1580,27 @@ app.post("/api/google-ads/publish", async (req, res) => {
       ...DEFAULT_SPEC_CONFIG,
       money: { billableUnitMicros: unitMicros, defaultAdGroupBidMicros: unitMicros },
     };
+    // Fallback para campañas generadas antes del stamp de website en generate-campaign
+    const website = (req.body as any)?.website || campaignData?.website;
+    
+    // Validación explícita de website ANTES del preflight: error claro si falta.
+    // Evita que el preflight falle con NO_PUBLISHABLE_STRUCTURE genérico
+    // cuando el problema real es que falta la URL del sitio web.
+    if (!website || typeof website !== "string" || !/^https?:\/\/.+/.test(website)) {
+      return res.status(400).json({
+        success: false,
+        partialSuccess: false,
+        publishable: false,
+        error: "No puedo publicar esta campaña porque falta la URL del sitio web (campo 'website' requerido, formato http(s)://...).",
+        customerId: cleanCustomerId,
+        stages: [],
+      });
+    }
+
     const genSpec = toGenerationSpec(campaignData, {
       customerId: cleanCustomerId,
       currencyCode,
-      // Fallback para campañas generadas antes del stamp de website en generate-campaign
-      website: (req.body as any)?.website || campaignData?.website,
+      website,
     });
     const pre = runPreflight(genSpec, specCfg);
 
@@ -1604,62 +1620,6 @@ app.post("/api/google-ads/publish", async (req, res) => {
     const omittedItems = pre.omittedItems.map(toCompatOmission);
 
     if (!pre.publishable || !pre.plan) {
-      // TRACE TEMPORAL de debugging (quitar tras identificar la causa):
-      // input/output de preflight SOLO para el grupo STAG_CupoDolar_Transaccional.
-      // Sin tokens, sin customerId completo, sin datos OAuth.
-      const TRACE_MATCH = "cupodolar";
-      const maskedCustomerId = `******${cleanCustomerId.slice(-4)}`;
-      const srcGroups = Array.isArray(campaignData?.adGroups) ? campaignData.adGroups : [];
-      const matchedInput = srcGroups.filter((g: any) =>
-        String(g?.name || "").toLowerCase().includes(TRACE_MATCH)
-      );
-      const matchedOutput = pre.normalizedSpec.adGroups.filter((g: any) =>
-        String(g?.adGroup?.name || "").toLowerCase().includes(TRACE_MATCH)
-      );
-      const debugPreflightTrace = {
-        note: "TRACE TEMPORAL - remover tras el diagnóstico",
-        customerIdMasked: maskedCustomerId,
-        websitePresent: Boolean(campaignData?.website),
-        matchedGroups: matchedInput.map((g: any) => {
-          const out = matchedOutput.find(
-            (o: any) => o?.adGroup?.name === g?.name
-          );
-          const inKw = Array.isArray(g?.keywords) ? g.keywords : [];
-          const inNeg = Array.isArray(g?.negatives) ? g.negatives : [];
-          const inAds = Array.isArray(g?.ads) ? g.ads : [];
-          return {
-            name: g?.name,
-            input: {
-              keywords: inKw,
-              negatives: inNeg,
-              ads: inAds.map((a: any) => ({
-                headlines: a?.headlines,
-                descriptions: a?.descriptions,
-                path1: a?.path1,
-                path2: a?.path2,
-              })),
-              headlinesCount: inAds.map((a: any) => (Array.isArray(a?.headlines) ? a.headlines.length : 0)),
-              descriptionsCount: inAds.map((a: any) => (Array.isArray(a?.descriptions) ? a.descriptions.length : 0)),
-              website: campaignData?.website || null,
-            },
-            preflight: {
-              sobrevive: Boolean(out),
-              keywordsIn: inKw.length + inNeg.length,
-              keywordsOut: out ? out.keywords.length : 0,
-              keywordsSurviving: out ? out.keywords.map((k: any) => `${k.negative ? "-" : ""}[${k.matchType}] ${k.text}`) : [],
-              adsIn: inAds.length,
-              adsOut: out ? out.ads.length : 0,
-            },
-            omittedItems: pre.omittedItems.filter(
-              (o: any) =>
-                String(o?.ref || "").toLowerCase().includes(TRACE_MATCH) ||
-                String(o?.ref || "") === g?.name
-            ),
-          };
-        }),
-        availableGroups: srcGroups.map((g: any) => g?.name),
-        blockingIssues: pre.blockingIssues,
-      };
       return res.status(422).json({
         success: false,
         partialSuccess: false,
@@ -1667,7 +1627,6 @@ app.post("/api/google-ads/publish", async (req, res) => {
         blockingIssues: pre.blockingIssues,
         correctionsApplied,
         omittedItems,
-        debugPreflightTrace,
         error: `Preflight bloqueó el publish: ${pre.blockingIssues.map((b) => `${b.field}: ${b.errorCode}`).join(" | ") || "estructura no publicable"}`,
         customerId: cleanCustomerId,
         stages: [],
